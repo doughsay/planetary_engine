@@ -43,12 +43,11 @@ const SPIRAL_STRENGTH: f32 = 0.5;    // Modulation depth (0 = none, 1 = full)
 // moving away from the plane, noise eats through, creating irregular edges.
 const DUST_SCALE: f32 = 5.5;         // Erosion noise frequency
 const DUST_STRENGTH: f32 = 0.70;     // Max darkness where dust is solid (0 = none, 1 = black)
-const DUST_WIDTH: f32 = 22.0;        // Base profile width (higher = tighter to midplane)
+const DUST_WIDTH_NEAR: f32 = 14.0;   // Width near the bulge (lower = wider dust band)
+const DUST_WIDTH_FAR: f32 = 80.0;    // Width at galactic edge (higher = thinner)
 const DUST_FILL: f32 = 1.8;          // Coverage before erosion (>1 = solid center guaranteed)
 const DUST_EROSION: f32 = 1.8;       // How aggressively noise eats into the edges
-                                     // (lower = sharper edges, less gradual fade)
-const DUST_CENTER_FALLOFF: f32 = 0.6; // How quickly dust thins away from galactic center
-                                     // (higher = dust disappears faster on opposite side)
+const DUST_TAPER: f32 = 0.8;         // How quickly dust narrows/fades away from the bulge
 
 // ── Star cloud clumping ─────────────────────────────────────────────────────
 // Medium-frequency brightness variation — denser and sparser star clouds
@@ -191,18 +190,16 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     let spiral = 1.0 - SPIRAL_STRENGTH * (1.0 - spiral_noise);
 
     // ── 4. Dust: continuous blanket with fractal-eroded edges ───────
-    // Start with a solid dust profile narrower than the glow band.
-    // Noise erodes inward from the edges — midplane stays fully covered,
-    // boundary becomes fractal and irregular.
-    let dust_base = exp(-DUST_WIDTH * sin_lat_sq);
+    // center_t drives both width tapering AND intensity fade:
+    //   near bulge (center_t→1): wide dust, high fill (solid, hard to erode)
+    //   far side   (center_t→0): narrow dust, low fill (erosion eats through)
+    let center_t = clamp(exp(-DUST_TAPER * (1.0 - gx)), 0.0, 1.0);
+    let dust_width = mix(DUST_WIDTH_FAR, DUST_WIDTH_NEAR, center_t);
+    let dust_fill = DUST_FILL * center_t;
+    let dust_base = exp(-dust_width * sin_lat_sq);
     let dust_coords = gal_pos * DUST_SCALE + vec3(7.0, 13.0, 23.0);
     let erosion = fbm3(dust_coords, 5);
-    // Dust thins out away from galactic center (more dust in inner disc).
-    // gx = cos(lat)*cos(lon), so gx > 0 means facing the center.
-    // Remap gx from [-1,1] to [1,0] as a falloff, with a tunable rate.
-    let center_proximity = exp(-DUST_CENTER_FALLOFF * (1.0 - gx));
-    let dust_opacity = clamp(dust_base * DUST_FILL - erosion * DUST_EROSION, 0.0, 1.0)
-                     * center_proximity;
+    let dust_opacity = clamp(dust_base * dust_fill - erosion * DUST_EROSION, 0.0, 1.0);
     let dust = 1.0 - DUST_STRENGTH * dust_opacity;
 
     // ── 5. Star cloud clumping ───────────────────────────────────────
