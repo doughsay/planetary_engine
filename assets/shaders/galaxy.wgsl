@@ -87,7 +87,7 @@ const DETAIL_STRENGTH: f32 = 0.15;   // Subtle variation amplitude
 // ── Color ───────────────────────────────────────────────────────────────────
 const COLOR_COOL: vec3<f32> = vec3(0.75, 0.82, 1.0);   // Silver-blue in disc
 const COLOR_WARM: vec3<f32> = vec3(1.0, 0.88, 0.65);   // Warm near bulge
-const COLOR_STRENGTH: f32 = 0.7;     // Mix strength (0 = all cool, 1 = full warm at bulge)
+const COLOR_STRENGTH: f32 = 0.5;     // Mix strength (0 = all cool, 1 = full warm at bulge)
 
 
 // ═══════════════════════════════════════════════════════════════════════════

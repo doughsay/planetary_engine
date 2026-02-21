@@ -263,7 +263,6 @@ pub enum NodeState {
 
 /// Quadtree for one cube face. Uses a flat HashMap for O(1) lookups.
 pub struct FaceQuadtree {
-    pub face: CubeFace,
     pub nodes: std::collections::HashMap<NodeId, NodeState>,
 }
 
@@ -271,7 +270,7 @@ impl FaceQuadtree {
     pub fn new(face: CubeFace) -> Self {
         let mut nodes = std::collections::HashMap::new();
         nodes.insert(NodeId::root(face), NodeState::Leaf);
-        Self { face, nodes }
+        Self { nodes }
     }
 
     /// All current leaf nodes.
