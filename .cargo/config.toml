@@ -1,0 +1,8 @@
+# Linux configuration (using mold)
+[target.x86_64-unknown-linux-gnu]
+linker = "clang"
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+
+# Windows configuration (using rust-lld)
+[target.x86_64-pc-windows-msvc]
+linker = "rust-lld.exe"
