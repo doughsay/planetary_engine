@@ -43,14 +43,9 @@ pub fn spawn_mesh_task(
     terrain: &TerrainConfig,
     neighbor_depths: NeighborDepths,
 ) {
-    // Clone the data needed for the async task.
-    // TerrainConfig is not Clone, so we extract the parameters and reconstruct.
-    let radius = terrain.radius;
-    let noise_scale = terrain.noise_scale;
-    let amplitude = terrain.amplitude;
+    let terrain = terrain.clone();
 
     let task = AsyncComputeTaskPool::get().spawn(async move {
-        let terrain = TerrainConfig::new(radius, noise_scale, amplitude, 0);
         generate_chunk_mesh(&node_id, &terrain, &neighbor_depths)
     });
 

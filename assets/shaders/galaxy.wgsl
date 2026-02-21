@@ -144,6 +144,7 @@ fn vertex(v: Vertex) -> VertexOutput {
     // Place the unit sphere at FAR_RADIUS, centred on the camera.
     let world_pos = v.position * FAR_RADIUS + view.world_position;
     out.clip_position = view.clip_from_world * vec4(world_pos, 1.0);
+    out.clip_position.z = 0.0;
 
     // Pass the direction (interpolated, re-normalised in fragment).
     out.world_dir = v.position;

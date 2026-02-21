@@ -16,6 +16,7 @@ pub type NeighborDepths = [Option<u8>; 4];
 /// Generates a mesh for a single quadtree chunk.
 ///
 /// The mesh vertices are in planet-local space (already displaced by terrain).
+/// Normals are computed from the vertex grid (no extra noise samples needed).
 /// Seam handling: when a neighbor is coarser (lower depth), we snap that edge's
 /// odd-indexed vertices to the midpoint of their even-indexed neighbors,
 /// matching the coarse grid and eliminating T-junction cracks.
@@ -25,60 +26,84 @@ pub fn generate_chunk_mesh(
     neighbor_depths: &NeighborDepths,
 ) -> Mesh {
     let res = CHUNK_RESOLUTION;
+    let max_idx = res - 1;
     let (u_min, v_min, u_max, v_max) = node_id.uv_bounds();
     let (normal, axis_a, axis_b) = node_id.face.axes();
 
     // LOD-aware octave count: coarse chunks use fewer octaves, fine chunks use more.
     let max_octaves = (terrain::BASE_OCTAVES + node_id.depth as usize).min(terrain::TOTAL_OCTAVES);
 
-    // Normal finite-difference delta scaled to chunk vertex spacing
-    let normal_delta = node_id.arc_length() / CHUNK_RESOLUTION as f32;
+    let num_verts = (res * res) as usize;
 
-    let mut positions: Vec<[f32; 3]> = Vec::with_capacity((res * res) as usize);
-    let mut normals: Vec<[f32; 3]> = Vec::with_capacity((res * res) as usize);
-    let mut uvs: Vec<[f32; 2]> = Vec::with_capacity((res * res) as usize);
-
-    // First pass: compute all vertex positions (before seam snapping)
-    let mut sphere_dirs: Vec<Vec3> = Vec::with_capacity((res * res) as usize);
-    let mut raw_positions: Vec<Vec3> = Vec::with_capacity((res * res) as usize);
+    // Pass 1: compute all vertex positions and apply seam snapping
+    let mut raw_positions: Vec<Vec3> = Vec::with_capacity(num_verts);
 
     for vy in 0..res {
         for vx in 0..res {
-            let u = u_min + (vx as f32 / (res - 1) as f32) * (u_max - u_min);
-            let v = v_min + (vy as f32 / (res - 1) as f32) * (v_max - v_min);
+            let u = u_min + (vx as f32 / max_idx as f32) * (u_max - u_min);
+            let v = v_min + (vy as f32 / max_idx as f32) * (v_max - v_min);
 
             let point_on_cube = normal + (u - 0.5) * 2.0 * axis_a + (v - 0.5) * 2.0 * axis_b;
             let dir = point_on_cube.normalize();
             let pos = terrain.get_displaced_position_lod(dir, max_octaves);
 
-            sphere_dirs.push(dir);
             raw_positions.push(pos);
         }
     }
 
-    // Second pass: apply seam snapping and compute normals
+    // Pass 2: apply seam snapping, build final positions and UVs
+    let mut positions: Vec<[f32; 3]> = Vec::with_capacity(num_verts);
+    let mut uvs: Vec<[f32; 2]> = Vec::with_capacity(num_verts);
+    let mut final_positions: Vec<Vec3> = Vec::with_capacity(num_verts);
+
     for vy in 0..res {
         for vx in 0..res {
             let idx = (vy * res + vx) as usize;
-            let mut pos = raw_positions[idx];
-
-            // Check if this vertex is on an edge that needs snapping
-            pos = snap_edge_vertex(
-                vx, vy, res, node_id.depth, neighbor_depths, &raw_positions, pos,
+            let pos = snap_edge_vertex(
+                vx, vy, res, node_id.depth, neighbor_depths, &raw_positions, raw_positions[idx],
             );
 
-            let dir = sphere_dirs[idx];
-            let u_frac = vx as f32 / (res - 1) as f32;
-            let v_frac = vy as f32 / (res - 1) as f32;
-
-            // Use axis_a and axis_b projected onto sphere tangent plane for normal calc
-            let tangent_dir = (axis_a - dir * dir.dot(axis_a)).normalize();
-            let bitangent_dir = (axis_b - dir * dir.dot(axis_b)).normalize();
-            let n = terrain.compute_normal(dir, tangent_dir, bitangent_dir, pos, normal_delta);
-
             positions.push(pos.into());
+            uvs.push([vx as f32 / max_idx as f32, vy as f32 / max_idx as f32]);
+            final_positions.push(pos);
+        }
+    }
+
+    // Pass 3: compute normals from the vertex grid using central differences.
+    // No noise evaluation needed — just cross products of neighbor positions.
+    let mut normals: Vec<[f32; 3]> = Vec::with_capacity(num_verts);
+
+    for vy in 0..res {
+        for vx in 0..res {
+            let idx = (vy * res + vx) as usize;
+            let p = final_positions[idx];
+
+            // Tangent (u direction): central difference, one-sided at edges
+            let tangent = if vx == 0 {
+                final_positions[idx + 1] - p
+            } else if vx == max_idx {
+                p - final_positions[idx - 1]
+            } else {
+                final_positions[idx + 1] - final_positions[idx - 1]
+            };
+
+            // Bitangent (v direction): central difference, one-sided at edges
+            let bitangent = if vy == 0 {
+                final_positions[idx + res as usize] - p
+            } else if vy == max_idx {
+                p - final_positions[idx - res as usize]
+            } else {
+                final_positions[idx + res as usize] - final_positions[idx - res as usize]
+            };
+
+            let mut n = tangent.cross(bitangent).normalize_or_zero();
+
+            // Ensure the normal points outwards (away from planet center)
+            if n.dot(p) < 0.0 {
+                n = -n;
+            }
+
             normals.push(n.into());
-            uvs.push([u_frac, v_frac]);
         }
     }
 

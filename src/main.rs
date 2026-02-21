@@ -29,7 +29,7 @@ const SUN_POSITION: Vec3 = Vec3::new(40000.0, 50000.0, 40000.0);
 
 /// Terrain noise parameters.
 const NOISE_SCALE: f32 = 4.0;
-const TERRAIN_AMPLITUDE: f32 = 50.0;
+const TERRAIN_AMPLITUDE: f32 = 150.0;
 
 fn main() {
     App::new()

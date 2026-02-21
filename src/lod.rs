@@ -16,8 +16,11 @@ const SPLIT_THRESHOLD: f32 = 1.0;
 /// Merge when all siblings' pixel error is below this (hysteresis).
 const MERGE_THRESHOLD: f32 = 0.5;
 
-/// Maximum number of splits per frame to avoid hitches.
-const MAX_SPLITS_PER_FRAME: usize = 16;
+/// Maximum number of splits per frame (including constraint-forced ones) to avoid hitches.
+const MAX_SPLITS_PER_FRAME: usize = 32;
+
+/// Maximum number of dirty chunk re-meshes per frame (neighbor depth changes).
+const MAX_REMESHES_PER_FRAME: usize = 16;
 
 /// Approximate perspective scale factor.
 /// Converts (world_error / distance) into pixel error for a ~1080p viewport.
@@ -165,13 +168,22 @@ pub fn update_lod(
         }
     }
 
-    // Apply splits after merges
+    // Apply splits after merges, respecting a total budget that includes
+    // constraint-forced splits to prevent cascading from overwhelming mesh generation.
+    let mut split_budget = MAX_SPLITS_PER_FRAME;
     for node in to_split {
-        split_with_constraint(&mut quadtree, node);
+        if split_budget == 0 {
+            break;
+        }
+        split_with_constraint(&mut quadtree, node, &mut split_budget);
     }
 }
 
-fn split_with_constraint(quadtree: &mut PlanetQuadtree, node: NodeId) {
+fn split_with_constraint(quadtree: &mut PlanetQuadtree, node: NodeId, budget: &mut usize) {
+    if *budget == 0 {
+        return;
+    }
+
     if let Some(tree) = quadtree.faces.get(&node.face) {
         if tree.nodes.get(&node) != Some(&NodeState::Leaf) {
             return;
@@ -184,13 +196,19 @@ fn split_with_constraint(quadtree: &mut PlanetQuadtree, node: NodeId) {
             let neighbor_leaf_depth = quadtree.leaf_depth_at(neighbor);
             if neighbor_leaf_depth < node.depth {
                 let ancestor = ancestor_at_depth(neighbor, neighbor_leaf_depth);
-                split_with_constraint(quadtree, ancestor);
+                split_with_constraint(quadtree, ancestor, budget);
             }
         }
     }
 
+    if *budget == 0 {
+        return;
+    }
+
     if let Some(tree) = quadtree.faces.get_mut(&node.face) {
-        tree.split(node);
+        if tree.split(node).is_some() {
+            *budget = budget.saturating_sub(1);
+        }
     }
 }
 
@@ -221,7 +239,10 @@ fn check_merge_constraint(quadtree: &PlanetQuadtree, parent: &NodeId) -> bool {
 
 /// System: synchronize chunk entities with the quadtree's desired leaf set.
 /// Uses async mesh generation — new chunks start with PendingMesh.
-/// Parent chunks being split get RetainUntilChildrenReady to avoid visual holes.
+/// Any existing visible chunk that is no longer a leaf is retained until
+/// the desired leaves covering its region all have completed meshes.
+/// This handles both directions: splitting (children replace parent) and
+/// merging (parent replaces children).
 pub fn sync_chunk_entities(
     mut commands: Commands,
     quadtree: Res<PlanetQuadtree>,
@@ -244,23 +265,12 @@ pub fn sync_chunk_entities(
         existing.insert(chunk.node_id, (entity, mesh.is_some()));
     }
 
-    // Identify which nodes are being split (existing chunk no longer a leaf, but its children are)
-    let mut nodes_being_split: HashSet<NodeId> = HashSet::new();
-    for (&node_id, &(_, has_mesh)) in &existing {
-        if !desired_leaves.contains(&node_id) && has_mesh {
-            // Check if its children are all in desired leaves
-            let children = node_id.children();
-            if children.iter().all(|c| desired_leaves.contains(c)) {
-                nodes_being_split.insert(node_id);
-            }
-        }
-    }
-
-    // Despawn chunks that are no longer leaves (unless retained for transition)
-    for (&node_id, &(entity, _)) in &existing {
+    // Any non-leaf chunk with a visible mesh is retained.
+    // cleanup_retained_parents will despawn it once its region is fully covered
+    // by completed-mesh desired leaves.
+    for (&node_id, &(entity, has_mesh)) in &existing {
         if !desired_leaves.contains(&node_id) {
-            if nodes_being_split.contains(&node_id) {
-                // Keep visible until children are ready
+            if has_mesh {
                 commands.entity(entity).insert(RetainUntilChildrenReady);
             } else {
                 commands.entity(entity).despawn();
@@ -297,27 +307,74 @@ pub fn sync_chunk_entities(
     }
 }
 
-/// System: clean up retained parent chunks once all children have meshes.
+/// System: clean up retained chunks once their spatial region is fully covered
+/// by completed-mesh desired leaves.
 pub fn cleanup_retained_parents(
     mut commands: Commands,
     retained: Query<(Entity, &ChunkNode), With<RetainUntilChildrenReady>>,
     all_chunks: Query<(&ChunkNode, Option<&PendingMesh>)>,
+    quadtree: Res<PlanetQuadtree>,
 ) {
-    for (entity, chunk) in &retained {
-        let children = chunk.node_id.children();
-        let all_children_ready = children.iter().all(|child_id| {
-            all_chunks
-                .iter()
-                .any(|(cn, pending)| cn.node_id == *child_id && pending.is_none())
-        });
+    if retained.is_empty() {
+        return;
+    }
 
-        if all_children_ready {
+    let desired_leaves = quadtree.all_leaves();
+
+    // Build a lookup: node_id -> has_completed_mesh
+    let mut chunk_ready: HashMap<NodeId, bool> = HashMap::new();
+    for (cn, pending) in &all_chunks {
+        chunk_ready.insert(cn.node_id, pending.is_none());
+    }
+
+    for (entity, chunk) in &retained {
+        if is_region_covered(&chunk.node_id, &desired_leaves, &chunk_ready) {
             commands.entity(entity).despawn();
         }
     }
 }
 
+/// Check if a retained chunk's spatial region is fully covered by ready desired leaves.
+fn is_region_covered(
+    node: &NodeId,
+    desired_leaves: &HashSet<NodeId>,
+    chunk_ready: &HashMap<NodeId, bool>,
+) -> bool {
+    // Merge case: an ancestor of this node is a desired leaf.
+    // If that ancestor has a completed mesh, the coarser mesh covers this region.
+    let mut ancestor_opt = node.parent();
+    while let Some(a) = ancestor_opt {
+        if desired_leaves.contains(&a) {
+            return chunk_ready.get(&a).copied().unwrap_or(false);
+        }
+        ancestor_opt = a.parent();
+    }
+
+    // Split case: this node's descendants are desired leaves.
+    // Check all descendant desired leaves have completed meshes.
+    let mut found_any = false;
+    for leaf in desired_leaves {
+        if is_ancestor_of(node, leaf) {
+            found_any = true;
+            if !chunk_ready.get(leaf).copied().unwrap_or(false) {
+                return false;
+            }
+        }
+    }
+    found_any
+}
+
+/// Returns true if `ancestor` is a strict ancestor of `node`.
+fn is_ancestor_of(ancestor: &NodeId, node: &NodeId) -> bool {
+    if ancestor.face != node.face || ancestor.depth >= node.depth {
+        return false;
+    }
+    let depth_diff = node.depth - ancestor.depth;
+    (node.x >> depth_diff) == ancestor.x && (node.y >> depth_diff) == ancestor.y
+}
+
 /// System: regenerate meshes for existing chunks whose neighbor depths changed.
+/// Budgeted to avoid overwhelming the async task pool when many neighbors change at once.
 pub fn regenerate_dirty_chunks(
     mut commands: Commands,
     quadtree: Res<PlanetQuadtree>,
@@ -327,7 +384,11 @@ pub fn regenerate_dirty_chunks(
         return;
     }
 
+    let mut remesh_count = 0;
     for (entity, mut chunk) in &mut chunks {
+        if remesh_count >= MAX_REMESHES_PER_FRAME {
+            break;
+        }
         let current_depths = quadtree.neighbor_depths(&chunk.node_id);
         if current_depths != chunk.neighbor_depths {
             chunk.neighbor_depths = current_depths;
@@ -338,6 +399,7 @@ pub fn regenerate_dirty_chunks(
                 &quadtree.terrain,
                 current_depths,
             );
+            remesh_count += 1;
         }
     }
 }

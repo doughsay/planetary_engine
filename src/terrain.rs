@@ -10,11 +10,15 @@ pub const BASE_OCTAVES: usize = 6;
 
 /// Central configuration for terrain generation.
 /// Uses a manual Fbm implementation so we can cap octaves per LOD level.
+#[derive(Clone)]
 pub struct TerrainConfig {
     sources: Vec<SuperSimplex>,
     frequency: f64,
     lacunarity: f64,
     persistence: f64,
+    /// Pre-computed amplitude sum for TOTAL_OCTAVES, used as a fixed divisor
+    /// so that changing octave count adds detail without rescaling earlier frequencies.
+    full_amp_sum: f64,
     pub radius: f32,
     pub noise_scale: f32,
     pub amplitude: f32,
@@ -27,11 +31,20 @@ impl TerrainConfig {
             sources.push(SuperSimplex::default().set_seed(seed + i as u32));
         }
 
+        let persistence = 0.5f64;
+        let mut full_amp_sum = 0.0f64;
+        let mut amp = 1.0f64;
+        for _ in 0..TOTAL_OCTAVES {
+            full_amp_sum += amp;
+            amp *= persistence;
+        }
+
         Self {
             sources,
             frequency: 1.0,
             lacunarity: 2.0,
-            persistence: 0.5,
+            persistence,
+            full_amp_sum,
             radius,
             noise_scale,
             amplitude,
@@ -53,12 +66,10 @@ impl TerrainConfig {
 
         let mut result = 0.0f64;
         let mut amplitude = 1.0f64;
-        let mut amp_sum = 0.0f64;
 
         for i in 0..octaves {
             let signal = self.sources[i].get(point);
             result += signal * amplitude;
-            amp_sum += amplitude;
 
             amplitude *= self.persistence;
             point[0] *= self.lacunarity;
@@ -66,15 +77,9 @@ impl TerrainConfig {
             point[2] *= self.lacunarity;
         }
 
-        // Normalize so output range stays roughly [-1, 1] regardless of octave count
-        (result / amp_sum) as f32
-    }
-
-    /// Returns the displaced position using all octaves (full detail).
-    pub fn get_displaced_position(&self, normalized_dir: Vec3) -> Vec3 {
-        let noise_value = self.sample_noise(normalized_dir, TOTAL_OCTAVES);
-        let elevation = self.radius + (noise_value * self.amplitude);
-        normalized_dir * elevation
+        // Divide by the fixed full-octave amplitude sum so that adding octaves
+        // adds fine detail without rescaling earlier frequencies.
+        (result / self.full_amp_sum) as f32
     }
 
     /// Returns the displaced position using a limited number of octaves.
@@ -83,35 +88,5 @@ impl TerrainConfig {
         let noise_value = self.sample_noise(normalized_dir, max_octaves);
         let elevation = self.radius + (noise_value * self.amplitude);
         normalized_dir * elevation
-    }
-
-    /// Computes a normal via finite differences. The `delta` parameter controls
-    /// the spacing of the finite-difference samples — should match the chunk's
-    /// vertex spacing for accurate normals at each LOD level.
-    pub fn compute_normal(
-        &self,
-        normalized_dir: Vec3,
-        tangent_dir: Vec3,
-        bitangent_dir: Vec3,
-        position: Vec3,
-        delta: f32,
-    ) -> Vec3 {
-        let p_right = (normalized_dir + tangent_dir * delta).normalize();
-        let p_right_displaced = self.get_displaced_position(p_right);
-
-        let p_up = (normalized_dir + bitangent_dir * delta).normalize();
-        let p_up_displaced = self.get_displaced_position(p_up);
-
-        let tangent = p_right_displaced - position;
-        let bitangent = p_up_displaced - position;
-
-        let mut normal = tangent.cross(bitangent).normalize();
-
-        // Ensure the normal points outwards
-        if normal.dot(normalized_dir) < 0.0 {
-            normal = -normal;
-        }
-
-        normal
     }
 }
