@@ -10,7 +10,7 @@ pub const BASE_OCTAVES: usize = 6;
 
 /// Central configuration for terrain generation.
 /// Uses a manual Fbm implementation so we can cap octaves per LOD level.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct TerrainConfig {
     sources: Vec<SuperSimplex>,
     frequency: f64,

@@ -7,6 +7,7 @@ use crate::chunk_mesh::{CHUNK_RESOLUTION, NeighborDepths};
 use crate::mesh_task::{PendingMesh, RetainUntilChildrenReady, spawn_mesh_task};
 use crate::quadtree::{CubeFace, FaceQuadtree, NodeId, NodeState};
 use crate::terrain::TerrainConfig;
+use crate::planet::Planet;
 
 /// Maximum quadtree depth. At radius 6360 and depth 15, each node covers ~10m.
 pub const MAX_DEPTH: u8 = 15;
@@ -24,24 +25,18 @@ const MAX_SPLITS_PER_FRAME: usize = 32;
 const MAX_REMESHES_PER_FRAME: usize = 16;
 
 /// Approximate perspective scale factor.
-/// Converts (world_error / distance) into pixel error for a ~1080p viewport.
-/// At 90° FOV on a 1920px-wide screen, 1 radian ≈ 1000 pixels.
-/// We use a lower value to avoid over-subdivision.
 const PERSPECTIVE_SCALE: f32 = 500.0;
-
-/// Marker component for the planet root entity.
-#[derive(Component)]
-pub struct Planet;
 
 /// Links a chunk entity to its quadtree node + caches neighbor depths.
 #[derive(Component)]
 pub struct ChunkNode {
     pub node_id: NodeId,
     pub neighbor_depths: NeighborDepths,
+    pub planet: Entity,
 }
 
-/// Resource holding the entire planet quadtree state.
-#[derive(Resource)]
+/// Component holding the entire planet quadtree state.
+#[derive(Component)]
 pub struct PlanetQuadtree {
     pub faces: HashMap<CubeFace, FaceQuadtree>,
     pub terrain: TerrainConfig,
@@ -52,7 +47,6 @@ impl PlanetQuadtree {
     pub fn new(
         terrain: TerrainConfig,
         material: Handle<StandardMaterial>,
-        _planet_center: Vec3,
     ) -> Self {
         let mut faces = HashMap::new();
         for &face in &CubeFace::ALL {
@@ -96,87 +90,81 @@ impl PlanetQuadtree {
 
 /// Compute screen-space pixel error for a node.
 fn screen_error(node: &NodeId, camera_pos: Vec3, radius: f32, planet_center: Vec3) -> f32 {
-    // Node center in world space = planet_center + direction * radius
     let node_center_world = planet_center + node.center_on_sphere() * radius;
     let distance = camera_pos.distance(node_center_world).max(1.0);
     let geometric_error = node.arc_length() * radius / CHUNK_RESOLUTION as f32;
     geometric_error / distance * PERSPECTIVE_SCALE
 }
 
-/// System: evaluate LOD and decide splits/merges.
+/// System: evaluate LOD and decide splits/merges for all planets.
 pub fn update_lod(
-    mut quadtree: ResMut<PlanetQuadtree>,
+    mut planet_q: Query<(Entity, &GlobalTransform, &mut PlanetQuadtree), With<Planet>>,
     camera_q: Query<&GlobalTransform, (With<Camera3d>, Without<Planet>)>,
-    planet_q: Query<&GlobalTransform, With<Planet>>,
 ) {
     let Ok(cam_global) = camera_q.single() else { return };
-    let Ok(planet_global) = planet_q.single() else { return };
+    let camera_pos: Vec3 = cam_global.translation().into();
 
-    // In big_space, GlobalTransform.translation() is the position relative to the floating origin.
-    // If the camera IS the floating origin, its translation will be ZERO.
-    let camera_pos: Vec3 = cam_global.translation();
-    let center: Vec3 = planet_global.translation();
-    let radius = quadtree.terrain.radius;
+    for (_planet_entity, planet_global, mut quadtree) in &mut planet_q {
+        let center: Vec3 = planet_global.translation().into();
+        let radius = quadtree.terrain.radius;
 
-    let leaves: Vec<NodeId> = quadtree.all_leaves().into_iter().collect();
+        let leaves: Vec<NodeId> = quadtree.all_leaves().into_iter().collect();
 
-    // Phase 1: Determine which nodes want to split
-    let mut to_split: Vec<NodeId> = Vec::new();
-    for &leaf in &leaves {
-        let err = screen_error(&leaf, camera_pos, radius, center);
-        if err > SPLIT_THRESHOLD && leaf.depth < MAX_DEPTH {
-            to_split.push(leaf);
+        // Phase 1: Determine which nodes want to split
+        let mut to_split: Vec<NodeId> = Vec::new();
+        for &leaf in &leaves {
+            let err = screen_error(&leaf, camera_pos, radius, center);
+            if err > SPLIT_THRESHOLD && leaf.depth < MAX_DEPTH {
+                to_split.push(leaf);
+            }
         }
-    }
 
-    // Sort by error (highest first) and limit splits per frame
-    to_split.sort_by(|a, b| {
-        let err_a = screen_error(a, camera_pos, radius, center);
-        let err_b = screen_error(b, camera_pos, radius, center);
-        err_b
-            .partial_cmp(&err_a)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    to_split.truncate(MAX_SPLITS_PER_FRAME);
+        // Sort by error (highest first) and limit splits per frame
+        to_split.sort_by(|a, b| {
+            let err_a = screen_error(a, camera_pos, radius, center);
+            let err_b = screen_error(b, camera_pos, radius, center);
+            err_b
+                .partial_cmp(&err_a)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        to_split.truncate(MAX_SPLITS_PER_FRAME);
 
-    // Phase 2: Always attempt merges (not just when splits are empty).
-    // This ensures chunks coarsen when the camera moves away, even while
-    // other parts of the quadtree are still refining.
-    let all_leaves = quadtree.all_leaves();
-    let mut merge_candidates: HashSet<NodeId> = HashSet::new();
-    for &leaf in &all_leaves {
-        if let Some(parent) = leaf.parent() {
-            merge_candidates.insert(parent);
+        // Phase 2: Attempt merges
+        let all_leaves = quadtree.all_leaves();
+        let mut merge_candidates: HashSet<NodeId> = HashSet::new();
+        for &leaf in &all_leaves {
+            if let Some(parent) = leaf.parent() {
+                merge_candidates.insert(parent);
+            }
         }
-    }
 
-    for parent in merge_candidates {
-        let children = parent.children();
-        if !children.iter().all(|c| all_leaves.contains(c)) {
-            continue;
-        }
-        let max_err = children
-            .iter()
-            .map(|c| screen_error(c, camera_pos, radius, center))
-            .fold(0.0f32, f32::max);
-        if max_err < MERGE_THRESHOLD {
-            let can_merge = check_merge_constraint(&quadtree, &parent);
-            if can_merge {
-                if let Some(tree) = quadtree.faces.get_mut(&parent.face) {
-                    tree.merge(parent);
+        for parent in merge_candidates {
+            let children = parent.children();
+            if !children.iter().all(|c| all_leaves.contains(c)) {
+                continue;
+            }
+            let max_err = children
+                .iter()
+                .map(|c| screen_error(c, camera_pos, radius, center))
+                .fold(0.0f32, f32::max);
+            if max_err < MERGE_THRESHOLD {
+                let can_merge = check_merge_constraint(&quadtree, &parent);
+                if can_merge {
+                    if let Some(tree) = quadtree.faces.get_mut(&parent.face) {
+                        tree.merge(parent);
+                    }
                 }
             }
         }
-    }
 
-    // Apply splits after merges, respecting a total budget that includes
-    // constraint-forced splits to prevent cascading from overwhelming mesh generation.
-    let mut split_budget = MAX_SPLITS_PER_FRAME;
-    for node in to_split {
-        if split_budget == 0 {
-            break;
+        // Phase 3: Apply splits
+        let mut split_budget = MAX_SPLITS_PER_FRAME;
+        for node in to_split {
+            if split_budget == 0 {
+                break;
+            }
+            split_with_constraint(&mut quadtree, node, &mut split_budget);
         }
-        split_with_constraint(&mut quadtree, node, &mut split_budget);
     }
 }
 
@@ -238,130 +226,116 @@ fn check_merge_constraint(quadtree: &PlanetQuadtree, parent: &NodeId) -> bool {
     true
 }
 
-/// System: synchronize chunk entities with the quadtree's desired leaf set.
-/// Uses async mesh generation — new chunks start with PendingMesh.
-/// Any existing visible chunk that is no longer a leaf is retained until
-/// the desired leaves covering its region all have completed meshes.
-/// This handles both directions: splitting (children replace parent) and
-/// merging (parent replaces children).
+/// System: synchronize chunk entities for all planets.
 pub fn sync_chunk_entities(
     mut commands: Commands,
-    quadtree: Res<PlanetQuadtree>,
-    planet_q: Query<Entity, With<Planet>>,
+    planet_q: Query<(Entity, &PlanetQuadtree), Changed<PlanetQuadtree>>,
     existing_chunks: Query<(Entity, &ChunkNode, Option<&Mesh3d>)>,
 ) {
-    if !quadtree.is_changed() {
-        return;
-    }
-
-    let Ok(planet_entity) = planet_q.single() else {
-        return;
-    };
-
-    let desired_leaves = quadtree.all_leaves();
-    info!("Syncing chunks: {} desired leaves", desired_leaves.len());
-
-    // Build map of existing chunks
-    let mut existing: HashMap<NodeId, (Entity, bool)> = HashMap::new();
+    // Build map of existing chunks grouped by planet
+    let mut existing_by_planet: HashMap<Entity, HashMap<NodeId, (Entity, bool)>> = HashMap::new();
     for (entity, chunk, mesh) in &existing_chunks {
-        existing.insert(chunk.node_id, (entity, mesh.is_some()));
+        existing_by_planet
+            .entry(chunk.planet)
+            .or_default()
+            .insert(chunk.node_id, (entity, mesh.is_some()));
     }
 
-    // Any non-leaf chunk with a visible mesh is retained.
-    // cleanup_retained_parents will despawn it once its region is fully covered
-    // by completed-mesh desired leaves.
-    for (&node_id, &(entity, has_mesh)) in &existing {
-        if !desired_leaves.contains(&node_id) {
-            if has_mesh {
-                commands.entity(entity).insert(RetainUntilChildrenReady);
-            } else {
-                commands.entity(entity).despawn();
+    for (planet_entity, quadtree) in &planet_q {
+        let desired_leaves = quadtree.all_leaves();
+        let existing = existing_by_planet.get(&planet_entity);
+
+        // Despawn or retain non-leaf chunks
+        if let Some(existing_map) = existing {
+            for (&node_id, &(entity, has_mesh)) in existing_map {
+                if !desired_leaves.contains(&node_id) {
+                    if has_mesh {
+                        commands.entity(entity).insert(RetainUntilChildrenReady);
+                    } else {
+                        commands.entity(entity).despawn();
+                    }
+                }
             }
         }
-    }
 
-    // Spawn new chunks with async mesh tasks
-    for &leaf in &desired_leaves {
-        if !existing.contains_key(&leaf) {
-            let neighbor_depths = quadtree.neighbor_depths(&leaf);
+        // Spawn new chunks
+        for &leaf in &desired_leaves {
+            let already_exists = existing.map_or(false, |m| m.contains_key(&leaf));
+            if !already_exists {
+                let neighbor_depths = quadtree.neighbor_depths(&leaf);
 
-            // In big_space 0.12.0, entities with high precision translation
-            // use CellCoord. They must be children of an entity with a Grid.
-            let chunk_entity = commands
-                .spawn((
-                    Transform::default(),
-                    Visibility::default(),
-                    ChunkNode {
-                        node_id: leaf,
-                        neighbor_depths,
-                    },
-                    CellCoord::default(),
-                ))
-                .id();
+                let chunk_entity = commands
+                    .spawn((
+                        Transform::default(),
+                        Visibility::default(),
+                        ChunkNode {
+                            node_id: leaf,
+                            neighbor_depths,
+                            planet: planet_entity,
+                        },
+                        CellCoord::default(),
+                    ))
+                    .id();
 
-            spawn_mesh_task(
-                &mut commands,
-                chunk_entity,
-                leaf,
-                &quadtree.terrain,
-                neighbor_depths,
-            );
+                spawn_mesh_task(
+                    &mut commands,
+                    chunk_entity,
+                    leaf,
+                    &quadtree.terrain,
+                    neighbor_depths,
+                );
 
-            commands.entity(planet_entity).add_child(chunk_entity);
+                commands.entity(planet_entity).add_child(chunk_entity);
+            }
         }
     }
 }
 
-/// System: clean up retained chunks once their spatial region is fully covered
-/// by completed-mesh desired leaves.
 pub fn cleanup_retained_parents(
     mut commands: Commands,
     retained: Query<(Entity, &ChunkNode), With<RetainUntilChildrenReady>>,
     all_chunks: Query<(&ChunkNode, Option<&PendingMesh>)>,
-    quadtree: Res<PlanetQuadtree>,
+    planet_q: Query<&PlanetQuadtree>,
 ) {
     if retained.is_empty() {
         return;
     }
 
-    let desired_leaves = quadtree.all_leaves();
-
-    // Build a lookup: node_id -> has_completed_mesh
-    let mut chunk_ready: HashMap<NodeId, bool> = HashMap::new();
+    // Build lookup: (planet, node_id) -> has_completed_mesh
+    let mut chunk_ready: HashMap<(Entity, NodeId), bool> = HashMap::new();
     for (cn, pending) in &all_chunks {
-        chunk_ready.insert(cn.node_id, pending.is_none());
+        chunk_ready.insert((cn.planet, cn.node_id), pending.is_none());
     }
 
     for (entity, chunk) in &retained {
-        if is_region_covered(&chunk.node_id, &desired_leaves, &chunk_ready) {
-            commands.entity(entity).despawn();
+        if let Ok(quadtree) = planet_q.get(chunk.planet) {
+            let desired_leaves = quadtree.all_leaves();
+            if is_region_covered(&chunk.node_id, chunk.planet, &desired_leaves, &chunk_ready) {
+                commands.entity(entity).despawn();
+            }
         }
     }
 }
 
-/// Check if a retained chunk's spatial region is fully covered by ready desired leaves.
 fn is_region_covered(
     node: &NodeId,
+    planet: Entity,
     desired_leaves: &HashSet<NodeId>,
-    chunk_ready: &HashMap<NodeId, bool>,
+    chunk_ready: &HashMap<(Entity, NodeId), bool>,
 ) -> bool {
-    // Merge case: an ancestor of this node is a desired leaf.
-    // If that ancestor has a completed mesh, the coarser mesh covers this region.
     let mut ancestor_opt = node.parent();
     while let Some(a) = ancestor_opt {
         if desired_leaves.contains(&a) {
-            return chunk_ready.get(&a).copied().unwrap_or(false);
+            return chunk_ready.get(&(planet, a)).copied().unwrap_or(false);
         }
         ancestor_opt = a.parent();
     }
 
-    // Split case: this node's descendants are desired leaves.
-    // Check all descendant desired leaves have completed meshes.
     let mut found_any = false;
     for leaf in desired_leaves {
         if is_ancestor_of(node, leaf) {
             found_any = true;
-            if !chunk_ready.get(leaf).copied().unwrap_or(false) {
+            if !chunk_ready.get(&(planet, *leaf)).copied().unwrap_or(false) {
                 return false;
             }
         }
@@ -369,7 +343,6 @@ fn is_region_covered(
     found_any
 }
 
-/// Returns true if `ancestor` is a strict ancestor of `node`.
 fn is_ancestor_of(ancestor: &NodeId, node: &NodeId) -> bool {
     if ancestor.face != node.face || ancestor.depth >= node.depth {
         return false;
@@ -378,38 +351,33 @@ fn is_ancestor_of(ancestor: &NodeId, node: &NodeId) -> bool {
     (node.x >> depth_diff) == ancestor.x && (node.y >> depth_diff) == ancestor.y
 }
 
-/// System: regenerate meshes for existing chunks whose neighbor depths changed.
-/// Budgeted to avoid overwhelming the async task pool when many neighbors change at once.
 pub fn regenerate_dirty_chunks(
     mut commands: Commands,
-    quadtree: Res<PlanetQuadtree>,
+    planet_q: Query<&PlanetQuadtree>,
     mut chunks: Query<(Entity, &mut ChunkNode), Without<PendingMesh>>,
 ) {
-    if !quadtree.is_changed() {
-        return;
-    }
-
     let mut remesh_count = 0;
     for (entity, mut chunk) in &mut chunks {
         if remesh_count >= MAX_REMESHES_PER_FRAME {
             break;
         }
-        let current_depths = quadtree.neighbor_depths(&chunk.node_id);
-        if current_depths != chunk.neighbor_depths {
-            chunk.neighbor_depths = current_depths;
-            spawn_mesh_task(
-                &mut commands,
-                entity,
-                chunk.node_id,
-                &quadtree.terrain,
-                current_depths,
-            );
-            remesh_count += 1;
+        if let Ok(quadtree) = planet_q.get(chunk.planet) {
+            let current_depths = quadtree.neighbor_depths(&chunk.node_id);
+            if current_depths != chunk.neighbor_depths {
+                chunk.neighbor_depths = current_depths;
+                spawn_mesh_task(
+                    &mut commands,
+                    entity,
+                    chunk.node_id,
+                    &quadtree.terrain,
+                    current_depths,
+                );
+                remesh_count += 1;
+            }
         }
     }
 }
 
-/// Plugin that sets up the LOD system.
 pub struct LodPlugin;
 
 impl Plugin for LodPlugin {

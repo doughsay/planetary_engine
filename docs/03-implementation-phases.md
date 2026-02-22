@@ -4,70 +4,74 @@ This is a large architectural shift. We break it into incremental phases where e
 
 ---
 
-## Phase 0: Foundation — `big_space` Integration
+## Phase 0: Foundation — `big_space` Integration ✅ COMPLETE
 
 **Goal**: Add floating origin without breaking anything. The planet still renders exactly as before, but now lives in a `big_space` grid cell.
 
 **Tasks**:
-1. Add `big_space = "0.12.0"` to Cargo.toml
-2. Add `BigSpacePlugin::<i64>` to the app
-3. Add `GridCell::<i64>` to the camera entity, mark it with `FloatingOrigin`
-4. Add `GridCell::<i64>` to the planet entity (and its children: chunks, atmosphere)
-5. Verify everything still renders correctly
-6. Test flying far from origin (> 100,000 km) to verify precision is maintained
+1. ✅ Add `big_space = "0.12.0"` to Cargo.toml
+2. ✅ Add `BigSpaceDefaultPlugins` to the app (replaces `TransformPlugin`)
+3. ✅ Add `CellCoord` to the camera entity, mark it with `FloatingOrigin`
+4. ✅ Add `CellCoord` to planet entities via `spawn_grid_default` / `spawn_spatial`
+5. ✅ Rendering works with big_space
+6. ⚠️ Far-distance precision not explicitly stress-tested yet
 
-**What changes**: `main.rs`, `camera.rs` (minor)
-**What doesn't change**: All terrain, quadtree, atmosphere, starfield, galaxy code
-**Risk**: Low — additive change, easy to revert
-**Deliverable**: Same visual result, but with floating origin infrastructure in place
+**What changed**: `main.rs` (BigSpaceRootBundle, Grid hierarchy, disable TransformPlugin)
+**API notes**: big_space 0.12 uses `CellCoord` (not `GridCell<i64>`), `BigSpaceDefaultPlugins` (not `BigSpacePlugin`), and `BigSpaceRootBundle` for the root entity. See CLAUDE.md for detailed big_space API notes.
+**Deliverable**: Floating origin infrastructure in place, multi-planet spawning works
 
 ---
 
-## Phase 1: Planet Abstraction
+## Phase 1: Planet Abstraction ✅ COMPLETE
 
 **Goal**: Extract planet-related code into a `Planet` component/plugin so we can spawn multiple planets.
 
 **Tasks**:
-1. Create `planet.rs` with `Planet` component (radius, terrain config, has_atmosphere flag)
-2. Create `PlanetPlugin` that registers planet-related systems
-3. Move planet spawning from `main.rs` into a system that reads `Planet` components
-4. Refactor atmosphere spawning to be driven by `Planet` entities
-5. Spawn a second planet (e.g., a smaller moon) at a different position to validate multi-planet
-6. Ensure LOD systems operate per-planet (each planet gets its own quadtree/chunk set)
+1. ✅ Create `planet.rs` with `Planet` component (holds TerrainConfig)
+2. ✅ Create `PlanetPlugin` (registered, currently empty — systems live in lod.rs)
+3. ✅ Planet spawning in `main.rs` setup_scene (Earth + Moon)
+4. ✅ Two planets (Earth + Moon) with different terrain configs, radii, and materials
+5. ✅ LOD systems operate per-planet — `update_lod` queries `With<Planet>`, each planet has its own `PlanetQuadtree`
 
-**What changes**: `main.rs` (simplifies), new `planet.rs`, `lod.rs` (per-planet), `atmosphere.rs` (per-planet)
-**What doesn't change**: Terrain generation, quadtree structure, mesh generation, camera, starfield, galaxy
-**Risk**: Medium — refactoring ECS relationships requires care
-**Deliverable**: Two planets visible, each with its own LOD and optional atmosphere
+**What changed**: New `planet.rs`, `lod.rs` (per-planet queries, `ChunkNode.planet` field), `main.rs` (multi-planet setup)
+**Note**: Atmosphere scrapped for now — will be re-added much later after the terrain pipeline rewrite.
+**Deliverable**: Two planets with independent LOD, terrain, and materials
 
 ---
 
-## Phase 1.5: Orbital Mechanics
+## Phase 1.5: Orbital Mechanics ✅ COMPLETE
 
 **Goal**: Planets orbit a central star. The sun becomes a physical entity at the origin, and each planet moves along a Keplerian orbit.
 
 **Tasks**:
-1. Create `orbit.rs` with an `Orbit` component:
-   - Keplerian parameters: semi-major axis, eccentricity, inclination, period, initial phase
-   - System that updates each planet's `GridCell` position each frame based on elapsed time
-2. Promote the sun from a `DirectionalLight` to a star entity:
-   - Spawn at `GridCell(0, 0, 0)` — the center of the system
-   - Optionally give it a visible mesh (emissive sphere) and its own starfield-style glow
-3. Compute per-planet `sun_direction` dynamically:
-   - `sun_dir = normalize(star_gridcell - planet_gridcell)` (in `big_space` coordinates)
-   - Pass to each planet's atmosphere material uniform and directional light
-4. Update the `DirectionalLight` to track the star-to-camera vector (so shadows stay correct regardless of which planet you're near)
-5. Test: watch a moon orbit a planet, or a planet orbit the star, from a stationary camera
+1. ✅ Create `orbit.rs` with `Orbit` component:
+   - Full Keplerian parameters (semi-major axis, eccentricity, inclination, LAN, arg of periapsis, period, initial mean anomaly)
+   - `OrbitalTime` resource with speed multiplier
+   - `update_orbits` system: f64 Keplerian solver → `Grid::translation_to_grid()` → CellCoord + Transform
+   - Hierarchical orbits via `parent: Option<Entity>` — resolved same-frame (no 1-frame lag)
+2. ✅ Sun as a visible entity:
+   - Emissive sphere mesh at origin with `Sun` marker component
+   - Spawned via `spawn_spatial` in the root grid
+3. ⬚ Per-planet `sun_direction` — **deferred (atmosphere scrapped for now)**
+4. ⬚ Dynamic `DirectionalLight` tracking — **deferred, light still hardcoded at (5000, 5000, 5000)**
+5. ✅ Camera tracking hotkeys: hold 1/2/3 to smoothly track Sun/Earth/Moon
+6. ✅ Test: Moon orbits Earth, Earth orbits Sun, visible from camera child of Earth
 
-**What changes**: New `orbit.rs`, `main.rs` (star entity, light updates), `atmosphere.rs` (dynamic sun_direction)
-**What doesn't change**: Terrain, quadtree, mesh generation, camera controls
-**Risk**: Low — orbital position updates are simple math on `GridCell` values
-**Deliverable**: Planets visibly orbiting a central star, with correct lighting from any viewpoint
+**What changed**: New `orbit.rs`, `main.rs` (Sun entity, micro-scale test system, camera tracking hotkeys)
+**Remaining gaps**:
+- Directional light doesn't track the Sun (terrain lit from fixed direction)
+- No time control keyboard shortcuts (speed is set to 1.0 in code)
+- Per-planet sun_direction deferred (atmosphere scrapped for now, will revisit later)
 
-**Notes**:
-- This phase can be done immediately after Phase 1 (planet abstraction) since it just moves planet entities around
-- Moon-style sub-orbits (moon orbits planet, planet orbits star) can be supported by making the orbit reference frame relative to a parent body
-- For realism, use `f64` for orbital calculations to avoid precision loss over long time periods, then convert to `GridCell<i64>` + `Transform` offset for rendering
+**Key implementation detail**: Orbital positions (in world units / km) must be converted to CellCoord via `Grid::translation_to_grid()`, NOT via `floor()`. `Grid::default()` has `cell_edge_length = 2000`, so naive `floor()` places entities 2000x too far apart.
+
+**Current test system** (micro scale for visual verification):
+- Sun: radius 2000, at origin
+- Earth: radius 1000, orbit 15,000 km, period 30s
+- Moon: radius 300, orbit 4,000 km around Earth, period 10s
+- Camera: child of Earth, 8,000 km above surface
+
+**Deliverable**: Planets visibly orbiting a central star with hierarchical orbit support
 
 ---
 
@@ -224,15 +228,9 @@ This is a large architectural shift. We break it into incremental phases where e
 
 ---
 
-## Recommended Starting Point
+## Recommended Next Step
 
-**Start with Phase 0** (`big_space` integration). It's:
-- Low risk (additive, easy to revert)
-- Immediately educational (learn `big_space` API hands-on)
-- Required by everything else (multi-planet needs floating origin)
-- Quick to implement (probably a single session)
-
-Then proceed to **Phase 1** (planet abstraction) before touching the terrain pipeline, because having multi-planet infrastructure in place means we can test the new density/octree system on a second planet while keeping the original planet working on the old system.
+**Phases 0, 1, and 1.5 are complete.** The next step is **Phase 2** (density field) or **Phase 3** (octree), which can be developed in parallel. The multi-planet + orbital infrastructure is in place, so the new density/octree system can be tested on the second planet (Moon) while keeping Earth on the old quadtree system.
 
 ---
 
@@ -245,11 +243,11 @@ Some phases have independent sub-tasks that can be developed in parallel:
 - **Phase 6 (seam stitching)** can be researched during Phases 3-5.
 
 ```
-Phase 0 ──> Phase 1 ──┬──> Phase 1.5 (orbits)
-                       │
-                       ├──> Phase 2 (density) ──┬──> Phase 4 ──> Phase 5 ──> Phase 6 ──> Phase 7
-                       │                        │
-                       └──> Phase 3 (octree) ───┘
+Phase 0 ✅ ──> Phase 1 ✅ ──┬──> Phase 1.5 ✅ (orbits)
+                             │
+                             ├──> Phase 2 (density) ──┬──> Phase 4 ──> Phase 5 ──> Phase 6 ──> Phase 7
+                             │                        │
+                             └──> Phase 3 (octree) ───┘
 ```
 
-Phase 1.5 (orbits) is independent of the terrain rewrite pipeline (Phases 2-6) and can be done at any point after Phase 1.
+Phases 0, 1, and 1.5 are complete. Phase 2 (density) and Phase 3 (octree) can be developed in parallel.

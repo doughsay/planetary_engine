@@ -20,16 +20,18 @@ pub fn poll_mesh_tasks(
     mut commands: Commands,
     mut pending: Query<(Entity, &mut PendingMesh, &ChunkNode)>,
     mut meshes: ResMut<Assets<Mesh>>,
-    quadtree: Res<PlanetQuadtree>,
+    planet_q: Query<&PlanetQuadtree>,
 ) {
-    for (entity, mut pending_mesh, _chunk) in &mut pending {
+    for (entity, mut pending_mesh, chunk) in &mut pending {
         if pending_mesh.0.is_finished() {
             if let Some(mesh) = block_on(poll_once(&mut pending_mesh.0)) {
-                commands.entity(entity).insert((
-                    Mesh3d(meshes.add(mesh)),
-                    MeshMaterial3d(quadtree.material.clone()),
-                ));
-                commands.entity(entity).remove::<PendingMesh>();
+                if let Ok(quadtree) = planet_q.get(chunk.planet) {
+                    commands.entity(entity).insert((
+                        Mesh3d(meshes.add(mesh)),
+                        MeshMaterial3d(quadtree.material.clone()),
+                    ));
+                    commands.entity(entity).remove::<PendingMesh>();
+                }
             }
         }
     }

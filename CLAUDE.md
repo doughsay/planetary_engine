@@ -6,6 +6,7 @@ A procedural planet rendering engine with quadtree LOD, atmospheric scattering, 
 
 - **Rust** (edition 2024)
 - **Bevy 0.18** - game engine / renderer
+- **big_space 0.12** - floating origin for large-scale worlds
 - **noise 0.9** - procedural terrain generation (Fbm + SuperSimplex)
 
 ## IMPORTANT: Bevy 0.18 API Notes
@@ -38,17 +39,71 @@ This project uses Bevy 0.18, which has significant breaking changes from earlier
 - **`AlphaMode::Premultiplied` and `AlphaMode::Add`** share the same blend state (`BLEND_PREMULTIPLIED_ALPHA`): `final = src.rgb + dst.rgb * (1 - src.a)`. The difference is purely in shader output — `alpha = 0` gives additive, `alpha > 0` gives premultiplied alpha with background attenuation.
 - **Depth prepass texture** is available at `@group(0) @binding(20)` behind `#ifdef DEPTH_PREPASS` when the camera has `DepthPrepass` component. Type is `texture_depth_2d` (or `texture_depth_multisampled_2d` with MSAA). The `DEPTH_PREPASS` shader def is automatically set by `MeshPipeline::specialize` via `MeshPipelineKey::DEPTH_PREPASS`.
 
+## IMPORTANT: big_space 0.12 API Notes
+
+This project uses `big_space` 0.12 for floating-origin precision at interplanetary scales. **The API has many subtle gotchas — read these carefully.**
+
+### Core Types (from `big_space::prelude::*`)
+- **`CellCoord`** — grid cell position (`x: GridPrecision, y: GridPrecision, z: GridPrecision`). `GridPrecision` defaults to `i64`.
+- **`Grid`** — component defining cell size. **`Grid::default()` has `cell_edge_length = 2000.0`** and `switching_threshold = 100.0`.
+- **`FloatingOrigin`** — marker component on the camera entity. Everything recenters around it.
+- **`BigSpace`** — marker component on the root entity (from `BigSpaceRootBundle`).
+- **`BigSpaceRootBundle`** — includes `Grid`, `BigSpace`, `GlobalTransform`. Spawn as the root of the entity hierarchy.
+
+### Entity Hierarchy
+```
+BigSpaceRootBundle (root_id)          ← has Grid + BigSpace
+  ├── Sun        (spawn_spatial)      ← CellCoord in root grid
+  ├── Light      (spawn_spatial)      ← CellCoord in root grid
+  ├── Earth      (spawn_grid_default) ← CellCoord in root grid + OWN Grid for children
+  │   └── Chunks (children)           ← CellCoord in Earth's sub-grid
+  │   └── Camera (child, FloatingOrigin)
+  └── Moon       (spawn_grid_default) ← CellCoord in root grid + OWN Grid for children
+      └── Chunks (children)           ← CellCoord in Moon's sub-grid
+```
+
+### Critical: Position ↔ CellCoord Conversion
+**NEVER convert positions to CellCoord by simply calling `floor()`.** The Grid has `cell_edge_length = 2000`, so `floor(15000.0) = 15000` cells × 2000 units/cell = 30,000,000 units — **2000x too far**. Always use:
+```rust
+let (cell, offset) = grid.translation_to_grid(world_pos_dvec3);
+```
+This divides by `cell_edge_length`, rounds, and computes the fractional offset correctly.
+
+### Critical: Multiple Grid Components
+`spawn_grid_default()` creates entities with their OWN `Grid` component (for sub-grid children). The root entity also has a `Grid` from `BigSpaceRootBundle`. To query only the root grid, filter with `With<BigSpace>`:
+```rust
+grid_q: Query<&Grid, With<BigSpace>>  // root grid only
+grid_q: Query<&Grid>                   // WRONG — matches root + all planet sub-grids
+```
+If `grid_q.single()` finds multiple matches it returns `Err` and silently fails.
+
+### spawn_spatial vs spawn_grid_default
+- **`spawn_spatial(bundle)`** — adds `CellCoord + Transform` to the entity. Use for simple positioned entities (Sun, lights, etc.) that don't need child grids.
+- **`spawn_grid_default(bundle)`** — adds `CellCoord + Transform + Grid`. Use for entities whose children need their own grid-cell positioning (planets with chunks as children).
+
+### Camera as Child Entity
+The camera can be a child of a planet entity (e.g., Earth) with `FloatingOrigin`. big_space computes the camera's absolute grid position by composing parent cells, so the floating origin correctly recenters around the camera's actual world position. The camera's own `CellCoord::default()` is fine — the parent's cell provides the offset.
+
+### TransformPlugin
+big_space replaces Bevy's `TransformPlugin`. The app must disable it:
+```rust
+DefaultPlugins.build().disable::<TransformPlugin>()
+```
+Then add `BigSpaceDefaultPlugins` which provides big_space's own transform propagation.
+
 ## Project Structure
 
 ```
 src/
-  main.rs        - App setup, plugins, lighting, camera spawn
+  main.rs        - App setup, plugins, lighting, camera spawn, scene setup
+  planet.rs      - Planet component + PlanetPlugin
+  orbit.rs       - Orbit component, OrbitalTime resource, Keplerian solver
   atmosphere.rs  - Per-planet sphere-mesh atmosphere (Material trait)
   camera.rs      - SpaceCamera: 6DOF flight controls (mouse, keyboard, scroll)
   terrain.rs     - TerrainConfig: noise evaluation + normal computation
   quadtree.rs    - CubeFace, NodeId, FaceQuadtree (pure data, no ECS)
   chunk_mesh.rs  - Per-node mesh generation with seam handling
-  lod.rs         - PlanetQuadtree resource, ChunkNode component, LOD systems
+  lod.rs         - PlanetQuadtree component, ChunkNode component, per-planet LOD systems
   mesh_task.rs   - Async mesh generation using AsyncComputeTaskPool
   starfield.rs   - Procedural starfield (~250k stars) with spectral colors
   galaxy.rs      - Procedural Milky Way backdrop (dust lanes, spiral arms, bulge)
@@ -62,10 +117,12 @@ assets/shaders/
 
 ### World Scale
 
-- **Radius: 6360.0** (1 world unit = 1 km)
-- Camera range: 6370 km (surface) to 50,000 km (deep space)
-- Atmosphere shell: planet_radius (6360) to atmo_radius (6460), 100 km thick
-- Scattering constants work directly in km (world units) — no unit conversion needed in shader
+- 1 world unit = 1 km
+- big_space `Grid::default()` cell_edge_length = 2000 units (2000 km per cell)
+- Current test system uses micro-scale constants (see main.rs):
+  - Sun radius: 2000, Earth radius: 1000, Moon radius: 300
+  - Earth orbit: 15,000 km (30s period), Moon orbit: 4,000 km around Earth (10s period)
+- Original single-planet scale: Radius 6360, atmosphere shell 100 km thick
 
 ### Terrain (`terrain.rs`)
 
@@ -90,7 +147,27 @@ Pure data structure (no ECS dependencies):
 - Vertices placed by mapping node's UV sub-range through cube-face projection + terrain displacement
 - **Seam handling**: when a neighbor is 1 level coarser, odd-indexed edge vertices snap to interpolated positions
 
+### Multi-Planet System
+
+- `Planet` component on each planet entity, `PlanetQuadtree` component holds per-planet quadtree state + material
+- `ChunkNode.planet: Entity` links each chunk to its owning planet
+- Planets are spawned via `spawn_grid_default` (each gets own sub-Grid for chunk children)
+- `Sun` marker component on the star entity, `Moon` marker on the moon
+- Camera tracking hotkeys: hold 1/2/3 to smoothly look at Sun/Earth/Moon
+
+### Orbital Mechanics (`orbit.rs`)
+
+- `Orbit` component: Keplerian parameters (semi_major_axis, eccentricity, inclination, LAN, arg_periapsis, period, initial_mean_anomaly, parent)
+- `OrbitalTime` resource: `speed` multiplier + `elapsed` time
+- `update_orbits` system runs each frame:
+  1. Compute local orbital position for each body via Kepler equation (Newton iteration solver)
+  2. Resolve parent chains same-frame (no 1-frame lag): child world_pos = child local + parent local
+  3. Convert world positions to CellCoord + offset via `Grid::translation_to_grid()` on the root grid (`With<BigSpace>`)
+- Hierarchical orbits: Moon has `parent: Some(earth_entity)`, Earth has `parent: None` (orbits origin)
+
 ### LOD System (`lod.rs`)
+
+**Per-planet LOD**: `update_lod` queries `With<Planet>`, each planet's `PlanetQuadtree` is evaluated independently against the camera position.
 
 **Screen-space error metric:**
 ```
@@ -101,12 +178,12 @@ Split if pixel_error > 1.0, Merge if < 0.5 (hysteresis)
 
 **Constraints:**
 - Max 1 level difference between adjacent leaves (forced splits propagate)
-- Max 16 splits per frame to avoid hitches
+- Max 32 splits per frame to avoid hitches
 - Max depth: 15 (~10m resolution at radius 6360)
 
 **Systems (ordered):**
-1. `update_lod` — evaluate screen error, decide splits/merges
-2. `sync_chunk_entities` — spawn/despawn entities to match desired leaf set
+1. `update_lod` — evaluate screen error per planet, decide splits/merges
+2. `sync_chunk_entities` — spawn/despawn entities to match desired leaf set (uses `Changed<PlanetQuadtree>`)
 3. `regenerate_dirty_chunks` — re-mesh chunks whose neighbor depths changed
 4. `poll_mesh_tasks` — collect completed async meshes
 5. `cleanup_retained_parents` — despawn old chunks once children are ready
