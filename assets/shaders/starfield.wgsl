@@ -63,7 +63,7 @@ fn vertex(v: Vertex) -> VertexOutput {
     );
 
     out.clip_position = clip_pos;
-    out.clip_position.z = 1e-6;
+    out.clip_position.z = 0.0;
     out.color = v.color_size.xyz;
     out.uv = v.corner * 0.5 + 0.5;
     out.core_fraction = core_size / total_size;

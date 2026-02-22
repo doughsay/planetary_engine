@@ -1,10 +1,11 @@
+use big_space::prelude::*;
 use bevy::asset::RenderAssetUsages;
 use bevy::camera::visibility::NoFrustumCulling;
 use bevy::mesh::{Indices, MeshVertexAttribute, MeshVertexBufferLayoutRef, PrimitiveTopology};
 use bevy::pbr::{MaterialPipeline, MaterialPipelineKey};
 use bevy::prelude::*;
 use bevy::render::render_resource::{
-    AsBindGroup, RenderPipelineDescriptor, SpecializedMeshPipelineError, VertexFormat,
+    AsBindGroup, CompareFunction, RenderPipelineDescriptor, SpecializedMeshPipelineError, VertexFormat,
 };
 use bevy::shader::ShaderRef;
 
@@ -62,8 +63,7 @@ pub struct StarfieldPlugin;
 impl Plugin for StarfieldPlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins(MaterialPlugin::<StarfieldMaterial>::default())
-            .insert_resource(ClearColor(Color::BLACK))
-            .add_systems(Startup, spawn_starfield);
+            .insert_resource(ClearColor(Color::BLACK));
     }
 }
 
@@ -111,6 +111,7 @@ impl Material for StarfieldMaterial {
         // Disable depth write — stars are behind everything.
         if let Some(depth_stencil) = &mut descriptor.depth_stencil {
             depth_stencil.depth_write_enabled = false;
+            depth_stencil.depth_compare = CompareFunction::GreaterEqual;
         }
 
         Ok(())
@@ -121,15 +122,15 @@ impl Material for StarfieldMaterial {
 // Startup system
 // ---------------------------------------------------------------------------
 
-fn spawn_starfield(
-    mut commands: Commands,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StarfieldMaterial>>,
+pub fn spawn_starfield(
+    root: &mut GridCommands,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<StarfieldMaterial>,
 ) {
     let mesh = build_star_mesh();
     let material = materials.add(StarfieldMaterial {});
 
-    commands.spawn((
+    root.spawn_spatial((
         Mesh3d(meshes.add(mesh)),
         MeshMaterial3d(material),
         Transform::default(),

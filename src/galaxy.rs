@@ -1,9 +1,10 @@
+use big_space::prelude::*;
 use bevy::camera::visibility::NoFrustumCulling;
 use bevy::mesh::MeshVertexBufferLayoutRef;
 use bevy::pbr::{MaterialPipeline, MaterialPipelineKey};
 use bevy::prelude::*;
 use bevy::render::render_resource::{
-    AsBindGroup, RenderPipelineDescriptor, SpecializedMeshPipelineError,
+    AsBindGroup, CompareFunction, RenderPipelineDescriptor, SpecializedMeshPipelineError,
 };
 use bevy::shader::ShaderRef;
 
@@ -17,8 +18,7 @@ pub struct GalaxyPlugin;
 
 impl Plugin for GalaxyPlugin {
     fn build(&self, app: &mut App) {
-        app.add_plugins(MaterialPlugin::<GalaxyMaterial>::default())
-            .add_systems(Startup, spawn_galaxy);
+        app.add_plugins(MaterialPlugin::<GalaxyMaterial>::default());
     }
 }
 
@@ -66,6 +66,7 @@ impl Material for GalaxyMaterial {
         // Render behind opaque geometry.
         if let Some(depth_stencil) = &mut descriptor.depth_stencil {
             depth_stencil.depth_write_enabled = false;
+            depth_stencil.depth_compare = CompareFunction::GreaterEqual;
         }
 
         // Camera is inside the sphere — render back faces.
@@ -79,17 +80,17 @@ impl Material for GalaxyMaterial {
 // Startup system
 // ---------------------------------------------------------------------------
 
-fn spawn_galaxy(
-    mut commands: Commands,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<GalaxyMaterial>>,
+pub fn spawn_galaxy(
+    root: &mut GridCommands,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<GalaxyMaterial>,
 ) {
     // Icosphere with 3 subdivisions = 642 vertices, 1280 triangles.
     // Enough tessellation that direction interpolation across triangles
     // is accurate (the fragment shader re-normalizes anyway).
     let mesh = Sphere::new(1.0).mesh().ico(3).unwrap();
 
-    commands.spawn((
+    root.spawn_spatial((
         Mesh3d(meshes.add(mesh)),
         MeshMaterial3d(materials.add(GalaxyMaterial {})),
         Transform::default(),

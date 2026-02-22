@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 bevy = "0.18.0"
+big_space = { version = "0.12.0", features = ["i64"] }
 noise = "0.9.0"
 
 [profile.dev]

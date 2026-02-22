@@ -1,3 +1,4 @@
+use big_space::prelude::*;
 use std::collections::{HashMap, HashSet};
 
 use bevy::prelude::*;
@@ -45,15 +46,13 @@ pub struct PlanetQuadtree {
     pub faces: HashMap<CubeFace, FaceQuadtree>,
     pub terrain: TerrainConfig,
     pub material: Handle<StandardMaterial>,
-    /// World-space position of the planet center.
-    pub planet_center: Vec3,
 }
 
 impl PlanetQuadtree {
     pub fn new(
         terrain: TerrainConfig,
         material: Handle<StandardMaterial>,
-        planet_center: Vec3,
+        _planet_center: Vec3,
     ) -> Self {
         let mut faces = HashMap::new();
         for &face in &CubeFace::ALL {
@@ -63,7 +62,6 @@ impl PlanetQuadtree {
             faces,
             terrain,
             material,
-            planet_center,
         }
     }
 
@@ -108,14 +106,17 @@ fn screen_error(node: &NodeId, camera_pos: Vec3, radius: f32, planet_center: Vec
 /// System: evaluate LOD and decide splits/merges.
 pub fn update_lod(
     mut quadtree: ResMut<PlanetQuadtree>,
-    camera_q: Query<&Transform, With<Camera3d>>,
+    camera_q: Query<&GlobalTransform, (With<Camera3d>, Without<Planet>)>,
+    planet_q: Query<&GlobalTransform, With<Planet>>,
 ) {
-    let Ok(cam_transform) = camera_q.single() else {
-        return;
-    };
-    let camera_pos = cam_transform.translation;
+    let Ok(cam_global) = camera_q.single() else { return };
+    let Ok(planet_global) = planet_q.single() else { return };
+
+    // In big_space, GlobalTransform.translation() is the position relative to the floating origin.
+    // If the camera IS the floating origin, its translation will be ZERO.
+    let camera_pos: Vec3 = cam_global.translation();
+    let center: Vec3 = planet_global.translation();
     let radius = quadtree.terrain.radius;
-    let center = quadtree.planet_center;
 
     let leaves: Vec<NodeId> = quadtree.all_leaves().into_iter().collect();
 
@@ -258,6 +259,7 @@ pub fn sync_chunk_entities(
     };
 
     let desired_leaves = quadtree.all_leaves();
+    info!("Syncing chunks: {} desired leaves", desired_leaves.len());
 
     // Build map of existing chunks
     let mut existing: HashMap<NodeId, (Entity, bool)> = HashMap::new();
@@ -283,6 +285,8 @@ pub fn sync_chunk_entities(
         if !existing.contains_key(&leaf) {
             let neighbor_depths = quadtree.neighbor_depths(&leaf);
 
+            // In big_space 0.12.0, entities with high precision translation
+            // use CellCoord. They must be children of an entity with a Grid.
             let chunk_entity = commands
                 .spawn((
                     Transform::default(),
@@ -291,6 +295,7 @@ pub fn sync_chunk_entities(
                         node_id: leaf,
                         neighbor_depths,
                     },
+                    CellCoord::default(),
                 ))
                 .id();
 
