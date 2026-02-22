@@ -1,28 +1,24 @@
 mod camera;
-mod chunk_mesh;
-mod lod;
-mod mesh_task;
-mod quadtree;
 mod galaxy;
 mod starfield;
-mod terrain;
 mod planet;
+mod planet_material;
 mod orbit;
 
 use big_space::prelude::*;
 use bevy::camera::Exposure;
+use bevy::camera::visibility::NoFrustumCulling;
 use bevy::core_pipeline::tonemapping::Tonemapping;
 use bevy::pbr::wireframe::{WireframeConfig, WireframePlugin};
 use bevy::prelude::*;
 use bevy::render::view::Hdr;
 use camera::{SpaceCamera, SpaceCameraPlugin, SpaceCameraState};
-use lod::{LodPlugin, PlanetQuadtree};
-use terrain::TerrainConfig;
 use planet::PlanetPlugin;
+use planet_material::{PlanetMaterial, PlanetSdfUniforms, SdfConfig};
 use orbit::{Orbit, OrbitPlugin, OrbitalTime};
 
 #[derive(Component)]
-struct Sun;
+pub struct Sun;
 
 #[derive(Component)]
 struct Moon;
@@ -30,11 +26,11 @@ struct Moon;
 /// MICRO SCALE constants for easy verification.
 const SUN_RADIUS: f32 = 2000.0;
 const EARTH_RADIUS: f32 = 1000.0;
-const EARTH_ORBIT_RADIUS: f64 = 15000.0; 
+const EARTH_ORBIT_RADIUS: f64 = 15000.0;
 const EARTH_PERIOD: f64 = 30.0; // 30 second year
 
 const MOON_RADIUS: f32 = 300.0;
-const MOON_ORBIT_RADIUS: f64 = 4000.0; 
+const MOON_ORBIT_RADIUS: f64 = 4000.0;
 const MOON_PERIOD: f64 = 10.0; // 10 second month
 
 const SUN_POSITION: Vec3 = Vec3::ZERO;
@@ -59,7 +55,6 @@ fn main() {
         .add_plugins(SpaceCameraPlugin)
         .add_plugins(PlanetPlugin)
         .add_plugins(OrbitPlugin)
-        .add_plugins(LodPlugin)
         .add_plugins(starfield::StarfieldPlugin)
         .add_plugins(galaxy::GalaxyPlugin)
         .add_systems(Startup, setup_scene)
@@ -71,6 +66,7 @@ fn setup_scene(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut planet_materials: ResMut<Assets<PlanetMaterial>>,
     mut starfield_materials: ResMut<Assets<starfield::StarfieldMaterial>>,
     mut galaxy_materials: ResMut<Assets<galaxy::GalaxyMaterial>>,
     mut orbital_time: ResMut<OrbitalTime>,
@@ -79,6 +75,9 @@ fn setup_scene(
     commands.insert_resource(ClearColor(Color::BLACK));
 
     let root_id = commands.spawn(BigSpaceRootBundle::default()).id();
+
+    // Shared terrain icosphere mesh (unit sphere — shader handles positioning)
+    let terrain_mesh = meshes.add(Sphere::new(1.0).mesh().ico(5).unwrap());
 
     {
         let mut grid_cmds = commands.grid(root_id, Grid::default());
@@ -107,30 +106,49 @@ fn setup_scene(
         ));
     }
 
-    let earth_terrain = TerrainConfig::new(EARTH_RADIUS, 4.0, 50.0, 0);
-    let earth_material = materials.add(StandardMaterial {
-        base_color: Color::srgb(0.3, 0.4, 0.6),
-        perceptual_roughness: 0.8,
-        ..default()
+    // ── Earth ────────────────────────────────────────────────────────────
+    let earth_sdf = SdfConfig {
+        radius: EARTH_RADIUS,
+        max_elevation: 50.0,
+        noise_frequency: 4.0,
+        noise_amplitude: 50.0,
+        noise_lacunarity: 2.0,
+        noise_persistence: 0.5,
+        noise_octaves: 14,
+    };
+
+    let earth_material_handle = planet_materials.add(PlanetMaterial {
+        uniforms: PlanetSdfUniforms::default(),
     });
 
-    let moon_terrain = TerrainConfig::new(MOON_RADIUS, 8.0, 20.0, 123);
-    let moon_material = materials.add(StandardMaterial {
-        base_color: Color::srgb(0.6, 0.6, 0.6),
-        perceptual_roughness: 0.9,
-        ..default()
+    // ── Moon ─────────────────────────────────────────────────────────────
+    let moon_sdf = SdfConfig {
+        radius: MOON_RADIUS,
+        max_elevation: 20.0,
+        noise_frequency: 8.0,
+        noise_amplitude: 20.0,
+        noise_lacunarity: 2.0,
+        noise_persistence: 0.5,
+        noise_octaves: 14,
+    };
+
+    let moon_material_handle = planet_materials.add(PlanetMaterial {
+        uniforms: PlanetSdfUniforms::default(),
     });
 
     let earth_id;
+    let moon_id;
 
     {
         let mut grid_cmds = commands.grid(root_id, Grid::default());
-        
+
         earth_id = grid_cmds.spawn_grid_default((
             Transform::default(),
             Visibility::default(),
-            planet::Planet { config: earth_terrain.clone() },
-            PlanetQuadtree::new(earth_terrain, earth_material),
+            planet::Planet {
+                sdf: earth_sdf,
+                material_handle: earth_material_handle.clone(),
+            },
             Orbit {
                 semi_major_axis: EARTH_ORBIT_RADIUS,
                 eccentricity: 0.0,
@@ -143,12 +161,14 @@ fn setup_scene(
             },
         )).id();
 
-        grid_cmds.spawn_grid_default((
+        moon_id = grid_cmds.spawn_grid_default((
             Moon,
             Transform::default(),
             Visibility::default(),
-            planet::Planet { config: moon_terrain.clone() },
-            PlanetQuadtree::new(moon_terrain, moon_material),
+            planet::Planet {
+                sdf: moon_sdf,
+                material_handle: moon_material_handle.clone(),
+            },
             Orbit {
                 semi_major_axis: MOON_ORBIT_RADIUS,
                 eccentricity: 0.0,
@@ -159,9 +179,32 @@ fn setup_scene(
                 initial_mean_anomaly: 0.0,
                 parent: Some(earth_id),
             },
-        ));
+        )).id();
     }
 
+    // Spawn terrain icosphere as child of Earth
+    commands.entity(earth_id).with_children(|parent| {
+        parent.spawn((
+            CellCoord::default(),
+            Mesh3d(terrain_mesh.clone()),
+            MeshMaterial3d(earth_material_handle),
+            Transform::default(),
+            NoFrustumCulling,
+        ));
+    });
+
+    // Spawn terrain icosphere as child of Moon
+    commands.entity(moon_id).with_children(|parent| {
+        parent.spawn((
+            CellCoord::default(),
+            Mesh3d(terrain_mesh.clone()),
+            MeshMaterial3d(moon_material_handle),
+            Transform::default(),
+            NoFrustumCulling,
+        ));
+    });
+
+    // Camera as child of Earth
     commands.entity(earth_id).with_children(|parent| {
         parent.spawn((
             CellCoord::default(),
