@@ -33,13 +33,17 @@ This project uses Bevy 0.18, which has significant breaking changes from earlier
 - **`GlobalTransform::to_matrix()`** returns `Mat4` (renamed from `compute_matrix()` in older Bevy)
 - **Avoid pre-composing projection + view matrices for inversion** — Bevy's own `ndc_to_world` explicitly avoids this (comments cite precision loss). Pass camera vectors (forward/right/up + FOV) to shaders instead of `world_from_clip` inverse matrices.
 - **`Camera::clip_from_view()`** returns `self.computed.clip_from_view` — defaults to `Mat4::ZERO` (not identity) until `camera_system` populates it. Can produce NaN when inverted before camera initialization completes.
+- **Material bind group is group 3** (`MATERIAL_BIND_GROUP_INDEX = 3`). In WGSL, use `@group(#{MATERIAL_BIND_GROUP}) @binding(N)` — the `#{MATERIAL_BIND_GROUP}` token is substituted by Bevy's shader preprocessor. Group 0 = view, group 1 = environment maps, group 2 = mesh data, group 3 = material. **Do NOT hardcode `@group(2)`** for material uniforms — that conflicts with mesh storage buffers.
+- **`bevy_pbr::mesh_functions`** imports `mesh_bindings::mesh` which declares `@group(2) @binding(0)`. For custom Material shaders that don't need the model transform, avoid importing `mesh_functions` entirely — compute world positions from uniforms instead (see galaxy/starfield/atmosphere shaders for this pattern).
+- **`AlphaMode::Premultiplied` and `AlphaMode::Add`** share the same blend state (`BLEND_PREMULTIPLIED_ALPHA`): `final = src.rgb + dst.rgb * (1 - src.a)`. The difference is purely in shader output — `alpha = 0` gives additive, `alpha > 0` gives premultiplied alpha with background attenuation.
+- **Depth prepass texture** is available at `@group(0) @binding(20)` behind `#ifdef DEPTH_PREPASS` when the camera has `DepthPrepass` component. Type is `texture_depth_2d` (or `texture_depth_multisampled_2d` with MSAA). The `DEPTH_PREPASS` shader def is automatically set by `MeshPipeline::specialize` via `MeshPipelineKey::DEPTH_PREPASS`.
 
 ## Project Structure
 
 ```
 src/
   main.rs        - App setup, plugins, lighting, camera spawn
-  atmosphere.rs  - Custom fullscreen post-process atmosphere (FullscreenMaterial)
+  atmosphere.rs  - Per-planet sphere-mesh atmosphere (Material trait)
   camera.rs      - SpaceCamera: 6DOF flight controls (mouse, keyboard, scroll)
   terrain.rs     - TerrainConfig: noise evaluation + normal computation
   quadtree.rs    - CubeFace, NodeId, FaceQuadtree (pure data, no ECS)
@@ -61,7 +65,7 @@ assets/shaders/
 - **Radius: 6360.0** (1 world unit = 1 km)
 - Camera range: 6370 km (surface) to 50,000 km (deep space)
 - Atmosphere shell: planet_radius (6360) to atmo_radius (6460), 100 km thick
-- `scene_units_to_m = 1000.0` — converts world units (km) to meters for scattering math
+- Scattering constants work directly in km (world units) — no unit conversion needed in shader
 
 ### Terrain (`terrain.rs`)
 
@@ -124,22 +128,30 @@ Split if pixel_error > 1.0, Merge if < 0.5 (hysteresis)
 
 ### Atmosphere (`atmosphere.rs` + `atmosphere.wgsl`)
 
-Custom fullscreen post-process atmosphere replacing Bevy's built-in `Atmosphere` component, using the `FullscreenMaterial` trait for render graph integration.
+Per-planet sphere-mesh atmosphere using Bevy's `Material` trait. Each planet gets its own atmosphere entity with an icosphere mesh, enabling multi-planet support without fullscreen shader interference.
 
 **Rust side (`atmosphere.rs`):**
-- `AtmosphereEffect` component: `Component + ExtractComponent + ShaderType + FullscreenMaterial`
-- Uniform struct fields: planet params (center, radius, atmo_radius), camera vectors (position, forward, right, up), FOV (fov_tan_half, aspect_ratio), sun_direction, scene_units_to_m
-- Runs in render graph between `StartMainPassPostProcessing` and `Tonemapping` (HDR space, pre-tonemap)
-- `update_atmosphere_uniforms` system in `PostUpdate` after `CameraUpdateSystems` — extracts camera vectors from `GlobalTransform` matrix columns and FOV/aspect from `Projection`
-- Camera entity requires `Hdr` component explicitly (the built-in `Atmosphere` had `#[require(Hdr)]` which auto-inserted it)
+- `AtmosphereMaterial` implements `Material` trait with `AsBindGroup` derive
+- `AtmosphereUniforms` (ShaderType): planet_center, planet_radius, sun_direction, atmo_radius, settings
+- `AlphaMode::Premultiplied` — blend equation `src + dst * (1 - src.a)` gives `inscatter + scene * transmittance`
+- Pipeline specialization: `cull_mode = None` (renders both faces), `depth_write = false`, `depth_compare = Always`
+- `enable_prepass() -> false`, `enable_shadows() -> false` — atmosphere doesn't participate in depth/shadow passes
 
 **Shader side (`atmosphere.wgsl`):**
-- Ray reconstruction from camera vectors + FOV (no matrix inversion — see lessons learned below)
+- Vertex shader computes world position from uniforms: `v.position * atmo_radius + planet_center` (unit sphere mesh, no mesh_functions import needed)
+- `@builtin(front_facing)` selects correct face: front when camera outside atmosphere, back when inside — prevents double-draw
 - Ray-sphere intersection for atmosphere shell and planet surface
+- Depth prepass texture (`#ifdef DEPTH_PREPASS`) for terrain-aware ray clamping: reconstructs terrain world position via `view.world_from_clip`, limits ray march to actual terrain depth
 - Rayleigh + Mie scattering ray march (16 view steps, 4 light steps)
-- Earth-like constants: `BETA_R = (5.5e-6, 13.0e-6, 22.4e-6)`, `H_R = 8000m`, `BETA_M = 21e-6`, `H_M = 1200m`, `G_MIE = 0.76`
+- Earth-like constants in km: `BETA_R = (5.5e-3, 13.0e-3, 22.4e-3)/km`, `H_R = 8km`, `BETA_M = 21e-3/km`, `H_M = 1.2km`, `G_MIE = 0.76`
 - Henyey-Greenstein phase function for Mie, analytical Rayleigh phase
-- Transmittance blending: `scene_color * transmittance + atmosphere_emission`
+- Sun shadow detection on light path (secondary ray-sphere against planet)
+- Premultiplied alpha output: `vec4(inscatter * SUN_INTENSITY, 1.0 - luminance(transmittance))`
+
+**Entity setup (main.rs):**
+- `Sphere::new(1.0).mesh().ico(5)` — unit icosphere, shader handles world positioning
+- `Transform::default()` + `NoFrustumCulling` — mesh position is shader-driven, not transform-driven
+- Camera requires `DepthPrepass` component for terrain-aware atmosphere
 
 **HDR pipeline:**
 - `Exposure::SUNLIGHT` + `Tonemapping::AcesFitted`
