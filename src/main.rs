@@ -8,7 +8,7 @@ mod galaxy;
 mod starfield;
 mod terrain;
 
-use atmosphere::AtmosphereEffect;
+use atmosphere::{AtmosphereMaterial, AtmosphereUniforms};
 use bevy::camera::Exposure;
 use bevy::core_pipeline::tonemapping::Tonemapping;
 use bevy::pbr::wireframe::{WireframeConfig, WireframePlugin};
@@ -54,7 +54,9 @@ fn main() {
 
 fn setup(
     mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut atmo_materials: ResMut<Assets<AtmosphereMaterial>>,
 ) {
     let terrain = TerrainConfig::new(PLANET_RADIUS, NOISE_SCALE, TERRAIN_AMPLITUDE, 0);
 
@@ -68,13 +70,6 @@ fn setup(
 
     commands.insert_resource(PlanetQuadtree::new(terrain, material.clone(), PLANET_CENTER));
 
-    // Planet root entity
-    commands.spawn((
-        Transform::from_translation(PLANET_CENTER),
-        Visibility::default(),
-        Planet,
-    ));
-
     // Directional "sun" light
     let sun_direction = (SUN_POSITION - PLANET_CENTER).normalize();
     commands.spawn((
@@ -87,30 +82,48 @@ fn setup(
             .looking_at(PLANET_CENTER, Vec3::Y),
     ));
 
-    // Camera with free-fly controls and atmosphere
+    // SINGLE Planet root entity
+    commands.spawn((
+        Transform::from_translation(PLANET_CENTER),
+        Visibility::default(),
+        Planet,
+    ));
+
+    let atmo_radius = PLANET_RADIUS + 100.0;
+
+    // Top-level Atmosphere entity
+    commands.spawn((
+        Mesh3d(meshes.add(Sphere::new(1.0).mesh().ico(5).unwrap())),
+        MeshMaterial3d(atmo_materials.add(AtmosphereMaterial {
+            uniforms: AtmosphereUniforms {
+                planet_radius: PLANET_RADIUS,
+                atmo_radius,
+                planet_center: PLANET_CENTER,
+                sun_direction,
+                settings: Vec4::new(1000.0, 0.0, 0.0, 0.0),
+            },
+        })),
+        Transform::default(),
+        Visibility::default(),
+        bevy::camera::visibility::NoFrustumCulling,
+    ));
+
+    // Camera with free-fly controls and depth prepass
     commands.spawn((
         Camera3d::default(),
+        bevy::core_pipeline::prepass::DepthPrepass,
         Transform::from_xyz(0.0, PLANET_CENTER.y, 20_000.0).looking_at(PLANET_CENTER, Vec3::Y),
         Projection::Perspective(PerspectiveProjection {
             far: 100_000.0,
-            near: 1.0,
+            near: 1.0, // Back to 1.0 for better depth precision
             ..default()
         }),
-        AtmosphereEffect {
-            planet_center: PLANET_CENTER,
-            planet_radius: PLANET_RADIUS,
-            atmo_radius: PLANET_RADIUS + 100.0,
-            sun_direction,
-            scene_units_to_m: 1000.0,
-            ..default()
-        },
         Hdr,
         Exposure::SUNLIGHT,
         Tonemapping::AcesFitted,
-        // 6DOF space camera: WASD to fly, QE to roll, mouse to look, scroll for speed, shift to boost
         SpaceCamera {
-            speed: 10.0,             // 10 km/s — good for surface flying
-            boost_multiplier: 50.0,  // 500 km/s — fast traversal space ↔ surface
+            speed: 10.0,
+            boost_multiplier: 50.0,
             sensitivity: 0.15,
             roll_speed: 1.5,
             friction: 5.0,

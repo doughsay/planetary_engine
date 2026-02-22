@@ -1,170 +1,208 @@
-#import bevy_core_pipeline::fullscreen_vertex_shader::FullscreenVertexOutput
-
-@group(0) @binding(0) var screen_texture: texture_2d<f32>;
-@group(0) @binding(1) var screen_sampler: sampler;
+#import bevy_pbr::mesh_view_bindings::view
 
 struct AtmosphereUniforms {
-    camera_position: vec3<f32>,
-    planet_radius: f32,
     planet_center: vec3<f32>,
-    atmo_radius: f32,
+    planet_radius: f32,
     sun_direction: vec3<f32>,
-    scene_units_to_m: f32,
-    camera_forward: vec3<f32>,
-    fov_tan_half: f32,
-    camera_right: vec3<f32>,
-    aspect_ratio: f32,
-    camera_up: vec3<f32>,
-    _padding: f32,
+    atmo_radius: f32,
+    settings: vec4<f32>,
 };
 
-@group(0) @binding(2) var<uniform> atmo: AtmosphereUniforms;
+@group(#{MATERIAL_BIND_GROUP}) @binding(0) var<uniform> material: AtmosphereUniforms;
 
-// ---------------------------------------------------------------------------
-// Scattering constants (Earth-like, values in per-meter)
-// ---------------------------------------------------------------------------
+// ── Depth prepass texture for terrain awareness ─────────────────────────────
+#ifdef DEPTH_PREPASS
+#ifdef MULTISAMPLED
+@group(0) @binding(20) var depth_prepass_texture: texture_depth_multisampled_2d;
+#else
+@group(0) @binding(20) var depth_prepass_texture: texture_depth_2d;
+#endif
+#endif
 
-// Rayleigh scattering coefficients at sea level (wavelength-dependent).
-const BETA_R: vec3<f32> = vec3(5.5e-6, 13.0e-6, 22.4e-6);
-// Rayleigh scale height in meters.
-const H_R: f32 = 8000.0;
+// ── Scattering constants (in km, 1 world unit = 1 km) ──────────────────────
+const BETA_R: vec3<f32> = vec3(5.5e-3, 13.0e-3, 22.4e-3); // Rayleigh per km
+const H_R: f32 = 8.0;                                       // Rayleigh scale height km
+const BETA_M: f32 = 21e-3;                                  // Mie per km
+const H_M: f32 = 1.2;                                       // Mie scale height km
+const G_MIE: f32 = 0.76;                                    // Mie anisotropy
 
-// Mie scattering coefficient at sea level (wavelength-independent grey).
-const BETA_M: f32 = 21e-6;
-// Mie scale height in meters.
-const H_M: f32 = 1200.0;
-// Mie preferred scattering direction (Henyey-Greenstein g parameter).
-const G_MIE: f32 = 0.76;
+const NUM_VIEW_STEPS: i32 = 16;
+const NUM_LIGHT_STEPS: i32 = 4;
+const SUN_INTENSITY: f32 = 20.0;
+const PI: f32 = 3.14159265;
 
-// Ray-march quality.
-const VIEW_STEPS: i32 = 16;
-const LIGHT_STEPS: i32 = 4;
+struct Vertex {
+    @location(0) position: vec3<f32>,
+}
 
-// ---------------------------------------------------------------------------
-// Utilities
-// ---------------------------------------------------------------------------
+struct VertexOutput {
+    @builtin(position) clip_position: vec4<f32>,
+    @location(0) world_position: vec3<f32>,
+}
 
-// Ray-sphere intersection. Returns (t_near, t_far) or (-1, -1) on miss.
+// ── Helper functions ────────────────────────────────────────────────────────
+
+// Returns (t_near, t_far). t_near > t_far means no intersection.
 fn ray_sphere(origin: vec3<f32>, dir: vec3<f32>, center: vec3<f32>, radius: f32) -> vec2<f32> {
     let oc = origin - center;
     let b = dot(oc, dir);
     let c = dot(oc, oc) - radius * radius;
     let disc = b * b - c;
     if disc < 0.0 {
-        return vec2(-1.0, -1.0);
+        return vec2(1e20, -1e20);
     }
-    let d = sqrt(disc);
-    return vec2(-b - d, -b + d);
+    let s = sqrt(disc);
+    return vec2(-b - s, -b + s);
 }
 
-// Rayleigh phase function.
-fn phase_rayleigh(cos_theta: f32) -> f32 {
-    return 3.0 / (16.0 * 3.14159265) * (1.0 + cos_theta * cos_theta);
+fn rayleigh_phase(cos_theta: f32) -> f32 {
+    return 3.0 / (16.0 * PI) * (1.0 + cos_theta * cos_theta);
 }
 
-// Henyey-Greenstein phase function for Mie scattering.
-fn phase_mie(cos_theta: f32, g: f32) -> f32 {
+fn hg_phase(cos_theta: f32, g: f32) -> f32 {
     let g2 = g * g;
     let denom = 1.0 + g2 - 2.0 * g * cos_theta;
-    return 3.0 / (8.0 * 3.14159265) * (1.0 - g2) / (denom * sqrt(denom) * (2.0 + g2));
+    return (1.0 - g2) / (4.0 * PI * pow(denom, 1.5));
 }
 
-// ---------------------------------------------------------------------------
-// Main fragment
-// ---------------------------------------------------------------------------
+// Optical depth from a point toward the sun through the atmosphere.
+fn sun_optical_depth(pos: vec3<f32>, sun_dir: vec3<f32>) -> vec3<f32> {
+    let pc = material.planet_center;
+    let pr = material.planet_radius;
+    let ar = material.atmo_radius;
+
+    // Check planet shadow
+    let planet_hit = ray_sphere(pos, sun_dir, pc, pr);
+    if planet_hit.x < planet_hit.y && planet_hit.x > 0.0 {
+        return vec3(1e10);
+    }
+
+    let atmo_hit = ray_sphere(pos, sun_dir, pc, ar);
+    let t_max = max(atmo_hit.y, 0.0);
+    if t_max <= 0.0 {
+        return vec3(0.0);
+    }
+
+    let step_size = t_max / f32(NUM_LIGHT_STEPS);
+    var depth = vec3(0.0);
+
+    for (var i: i32 = 0; i < NUM_LIGHT_STEPS; i++) {
+        let t = (f32(i) + 0.5) * step_size;
+        let p = pos + sun_dir * t;
+        let alt = max(length(p - pc) - pr, 0.0);
+
+        depth += (BETA_R * exp(-alt / H_R) + vec3(BETA_M) * exp(-alt / H_M)) * step_size;
+    }
+
+    return depth;
+}
+
+// ── Vertex shader ───────────────────────────────────────────────────────────
+
+@vertex
+fn vertex(v: Vertex) -> VertexOutput {
+    var out: VertexOutput;
+    // Unit sphere vertex → world position on the atmosphere shell
+    let world_pos = v.position * material.atmo_radius + material.planet_center;
+    out.clip_position = view.clip_from_world * vec4(world_pos, 1.0);
+    out.world_position = world_pos;
+    return out;
+}
+
+// ── Fragment shader ─────────────────────────────────────────────────────────
 
 @fragment
-fn fragment(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
-    let scene_color = textureSample(screen_texture, screen_sampler, in.uv);
+fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> @location(0) vec4<f32> {
+    let cam_pos = view.world_position;
+    let pc = material.planet_center;
+    let pr = material.planet_radius;
+    let ar = material.atmo_radius;
 
-    // Reconstruct view ray from camera vectors and UV.
-    let ndc = vec2(in.uv.x * 2.0 - 1.0, 1.0 - in.uv.y * 2.0);
-    let ray_dir = normalize(
-        atmo.camera_forward
-        + ndc.x * atmo.camera_right * atmo.fov_tan_half * atmo.aspect_ratio
-        + ndc.y * atmo.camera_up * atmo.fov_tan_half
-    );
-    let ray_origin = atmo.camera_position;
+    // Decide which face to shade to avoid double-draw.
+    // Outside atmosphere: shade front faces only.
+    // Inside atmosphere: shade back faces only.
+    let cam_dist = length(cam_pos - pc);
+    let inside = cam_dist < ar;
 
-    // Intersect with atmosphere shell.
-    let t_atmo = ray_sphere(ray_origin, ray_dir, atmo.planet_center, atmo.atmo_radius);
-    if t_atmo.y < 0.0 {
-        // Ray misses atmosphere entirely.
-        return scene_color;
+    if is_front && inside {
+        discard;
+    }
+    if !is_front && !inside {
+        discard;
     }
 
-    // Intersect with planet surface to know where the ground blocks the view.
-    let t_planet = ray_sphere(ray_origin, ray_dir, atmo.planet_center, atmo.planet_radius);
+    let ray_dir = normalize(in.world_position - cam_pos);
 
-    // Determine the segment of the ray that passes through the atmosphere.
-    let t_start = max(t_atmo.x, 0.0);
-    var t_end = t_atmo.y;
-    if t_planet.x > 0.0 {
-        // Ray hits the planet; atmosphere ends at the planet surface.
-        t_end = min(t_end, t_planet.x);
+    // Intersect the view ray with atmosphere and planet spheres
+    let atmo_hit = ray_sphere(cam_pos, ray_dir, pc, ar);
+    if atmo_hit.x > atmo_hit.y {
+        discard;
     }
 
-    let step_len = (t_end - t_start) / f32(VIEW_STEPS);
-    let scale = atmo.scene_units_to_m; // world units → meters
+    let t_enter = max(atmo_hit.x, 0.0);
+    var t_exit = atmo_hit.y;
 
-    // Accumulators.
-    var sum_r = vec3(0.0);
-    var sum_m = vec3(0.0);
-    var optical_depth_r = 0.0;
-    var optical_depth_m = 0.0;
-
-    // March along the view ray through the atmosphere.
-    for (var i = 0; i < VIEW_STEPS; i++) {
-        let t = t_start + (f32(i) + 0.5) * step_len;
-        let sample_pos = ray_origin + ray_dir * t;
-
-        // Height above the planet surface in meters.
-        let height_m = (length(sample_pos - atmo.planet_center) - atmo.planet_radius) * scale;
-
-        // Local density at this height.
-        let density_r = exp(-height_m / H_R) * step_len * scale;
-        let density_m = exp(-height_m / H_M) * step_len * scale;
-        optical_depth_r += density_r;
-        optical_depth_m += density_m;
-
-        // Light ray toward the sun: check if this sample point can see the sun.
-        let t_light = ray_sphere(sample_pos, atmo.sun_direction, atmo.planet_center, atmo.atmo_radius);
-        let light_step = t_light.y / f32(LIGHT_STEPS);
-
-        var light_depth_r = 0.0;
-        var light_depth_m = 0.0;
-        for (var j = 0; j < LIGHT_STEPS; j++) {
-            let t_l = (f32(j) + 0.5) * light_step;
-            let light_pos = sample_pos + atmo.sun_direction * t_l;
-            let light_h = (length(light_pos - atmo.planet_center) - atmo.planet_radius) * scale;
-            light_depth_r += exp(-light_h / H_R) * light_step * scale;
-            light_depth_m += exp(-light_h / H_M) * light_step * scale;
-        }
-
-        // Combined extinction along the full path (camera → sample → sun).
-        let tau = BETA_R * (optical_depth_r + light_depth_r)
-                + BETA_M * (optical_depth_m + light_depth_m);
-        let attenuation = exp(-tau);
-
-        sum_r += density_r * attenuation;
-        sum_m += density_m * attenuation;
+    // Clamp to idealized planet sphere (fallback when depth prepass unavailable)
+    let planet_hit = ray_sphere(cam_pos, ray_dir, pc, pr);
+    if planet_hit.x < planet_hit.y && planet_hit.x > 0.0 {
+        t_exit = min(t_exit, planet_hit.x);
     }
 
-    // Phase functions.
-    let cos_theta = dot(ray_dir, atmo.sun_direction);
-    let pr = phase_rayleigh(cos_theta);
-    let pm = phase_mie(cos_theta, G_MIE);
+    // Clamp to actual terrain depth from the depth prepass
+#ifdef DEPTH_PREPASS
+    let pixel = vec2<i32>(in.clip_position.xy);
+    let scene_depth = textureLoad(depth_prepass_texture, pixel, 0);
+    if scene_depth > 0.0 {
+        // Reconstruct terrain world position from depth buffer
+        let uv = (in.clip_position.xy - view.viewport.xy) / view.viewport.zw;
+        let ndc_xy = uv * vec2(2.0, -2.0) + vec2(-1.0, 1.0);
+        let world_h = view.world_from_clip * vec4(ndc_xy, scene_depth, 1.0);
+        let terrain_pos = world_h.xyz / world_h.w;
+        let t_terrain = length(terrain_pos - cam_pos);
+        t_exit = min(t_exit, t_terrain);
+    }
+#endif
 
-    // Sun intensity (in HDR space, will be tonemapped later).
-    let sun_intensity = vec3(20.0);
+    let path_length = t_exit - t_enter;
+    if path_length <= 0.0 {
+        discard;
+    }
 
-    // Final in-scattered light.
-    let atmosphere_color = sun_intensity * (sum_r * BETA_R * pr + sum_m * BETA_M * pm);
+    // Ray march through the atmosphere shell
+    let step_size = path_length / f32(NUM_VIEW_STEPS);
+    let sun_dir = material.sun_direction;
+    let cos_theta = dot(ray_dir, sun_dir);
+    let phase_r = rayleigh_phase(cos_theta);
+    let phase_m = hg_phase(cos_theta, G_MIE);
 
-    // Transmittance along the full view path through atmosphere.
-    let transmittance = exp(-(BETA_R * optical_depth_r + BETA_M * optical_depth_m));
+    var transmittance = vec3(1.0);
+    var in_scatter = vec3(0.0);
 
-    // Blend: attenuate scene through atmosphere, add in-scattered light.
-    let final_color = scene_color.rgb * transmittance + atmosphere_color;
-    return vec4(final_color, scene_color.a);
+    for (var i: i32 = 0; i < NUM_VIEW_STEPS; i++) {
+        let t = t_enter + (f32(i) + 0.5) * step_size;
+        let pos = cam_pos + ray_dir * t;
+        let altitude = max(length(pos - pc) - pr, 0.0);
+
+        let rho_r = exp(-altitude / H_R);
+        let rho_m = exp(-altitude / H_M);
+
+        // Extinction for this step
+        let tau_step = (BETA_R * rho_r + vec3(BETA_M) * rho_m) * step_size;
+
+        // Light reaching this point from the sun
+        let light_tau = sun_optical_depth(pos, sun_dir);
+        let sun_atten = exp(-light_tau);
+
+        // Accumulated in-scatter
+        let scatter = (BETA_R * rho_r * phase_r + vec3(BETA_M) * rho_m * phase_m) * sun_atten;
+        in_scatter += scatter * transmittance * step_size;
+
+        transmittance *= exp(-tau_step);
+    }
+
+    // Premultiplied alpha output:
+    //   blend equation: final = src.rgb + dst.rgb * (1 - src.a)
+    //   result: in_scatter + scene * avg_transmittance
+    let avg_transmittance = dot(transmittance, vec3(0.2126, 0.7152, 0.0722));
+    return vec4(in_scatter * SUN_INTENSITY, 1.0 - avg_transmittance);
 }

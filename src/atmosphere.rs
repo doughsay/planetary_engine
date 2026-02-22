@@ -1,44 +1,74 @@
-use bevy::camera::CameraUpdateSystems;
-use bevy::core_pipeline::core_3d::graph::Node3d;
-use bevy::core_pipeline::fullscreen_material::{FullscreenMaterial, FullscreenMaterialPlugin};
+use bevy::mesh::MeshVertexBufferLayoutRef;
+use bevy::pbr::{MaterialPipeline, MaterialPipelineKey};
 use bevy::prelude::*;
-use bevy::render::extract_component::ExtractComponent;
-use bevy::render::render_graph::{InternedRenderLabel, RenderLabel};
-use bevy::render::render_resource::ShaderType;
+use bevy::render::render_resource::{
+    AsBindGroup, CompareFunction, RenderPipelineDescriptor, ShaderType,
+    SpecializedMeshPipelineError,
+};
 use bevy::shader::ShaderRef;
 
-/// Atmosphere post-process effect. Add this component to a Camera3d entity.
-///
-/// Camera-derived fields (`camera_position`, `camera_forward`, `camera_right`,
-/// `camera_up`, `fov_tan_half`, `aspect_ratio`, `sun_direction`) are updated
-/// automatically each frame by [`update_atmosphere_uniforms`].
-#[derive(Component, ExtractComponent, Clone, Copy, ShaderType, Default, Debug)]
-pub struct AtmosphereEffect {
-    pub camera_position: Vec3,
-    pub planet_radius: f32,
+#[derive(Clone, Copy, ShaderType, Debug)]
+pub struct AtmosphereUniforms {
     pub planet_center: Vec3,
-    pub atmo_radius: f32,
+    pub planet_radius: f32,
     pub sun_direction: Vec3,
-    pub scene_units_to_m: f32,
-    pub camera_forward: Vec3,
-    pub fov_tan_half: f32,
-    pub camera_right: Vec3,
-    pub aspect_ratio: f32,
-    pub camera_up: Vec3,
-    pub _padding: f32,
+    pub atmo_radius: f32,
+    pub settings: Vec4, // x: scene_units_to_m, yzw: unused
 }
 
-impl FullscreenMaterial for AtmosphereEffect {
+#[derive(Asset, TypePath, AsBindGroup, Clone, Debug)]
+pub struct AtmosphereMaterial {
+    #[uniform(0)]
+    pub uniforms: AtmosphereUniforms,
+}
+
+impl Default for AtmosphereMaterial {
+    fn default() -> Self {
+        Self {
+            uniforms: AtmosphereUniforms {
+                planet_center: Vec3::ZERO,
+                planet_radius: 6360.0,
+                sun_direction: Vec3::Y,
+                atmo_radius: 6460.0,
+                settings: Vec4::new(1000.0, 0.0, 0.0, 0.0),
+            },
+        }
+    }
+}
+
+impl Material for AtmosphereMaterial {
+    fn vertex_shader() -> ShaderRef {
+        "shaders/atmosphere.wgsl".into()
+    }
+
     fn fragment_shader() -> ShaderRef {
         "shaders/atmosphere.wgsl".into()
     }
 
-    fn node_edges() -> Vec<InternedRenderLabel> {
-        vec![
-            Node3d::StartMainPassPostProcessing.intern(),
-            Self::node_label().intern(),
-            Node3d::Tonemapping.intern(),
-        ]
+    fn alpha_mode(&self) -> AlphaMode {
+        AlphaMode::Premultiplied
+    }
+
+    fn enable_prepass() -> bool {
+        false
+    }
+
+    fn enable_shadows() -> bool {
+        false
+    }
+
+    fn specialize(
+        _pipeline: &MaterialPipeline,
+        descriptor: &mut RenderPipelineDescriptor,
+        _layout: &MeshVertexBufferLayoutRef,
+        _key: MaterialPipelineKey<Self>,
+    ) -> Result<(), SpecializedMeshPipelineError> {
+        descriptor.primitive.cull_mode = None;
+        if let Some(depth_stencil) = &mut descriptor.depth_stencil {
+            depth_stencil.depth_write_enabled = false;
+            depth_stencil.depth_compare = CompareFunction::Always;
+        }
+        Ok(())
     }
 }
 
@@ -46,38 +76,6 @@ pub struct AtmospherePlugin;
 
 impl Plugin for AtmospherePlugin {
     fn build(&self, app: &mut App) {
-        app.add_plugins(FullscreenMaterialPlugin::<AtmosphereEffect>::default())
-            .add_systems(
-                PostUpdate,
-                update_atmosphere_uniforms.after(CameraUpdateSystems),
-            );
-    }
-}
-
-fn update_atmosphere_uniforms(
-    mut atmo_q: Query<(&mut AtmosphereEffect, &GlobalTransform, &Projection)>,
-    sun_q: Query<&GlobalTransform, With<DirectionalLight>>,
-) {
-    let Ok((mut atmo, cam_transform, projection)) = atmo_q.single_mut() else {
-        return;
-    };
-
-    // Extract camera vectors from the world transform matrix.
-    // Column 0 = right (+X local), column 1 = up (+Y local),
-    // column 2 = back (+Z local, camera looks along -Z).
-    let m = cam_transform.to_matrix();
-    atmo.camera_position = cam_transform.translation();
-    atmo.camera_right = m.x_axis.truncate().normalize();
-    atmo.camera_up = m.y_axis.truncate().normalize();
-    atmo.camera_forward = (-m.z_axis.truncate()).normalize();
-
-    // FOV and aspect from the perspective projection.
-    if let Projection::Perspective(persp) = projection {
-        atmo.fov_tan_half = (persp.fov / 2.0).tan();
-        atmo.aspect_ratio = persp.aspect_ratio;
-    }
-
-    if let Ok(sun_transform) = sun_q.single() {
-        atmo.sun_direction = (-*sun_transform.forward()).normalize_or_zero();
+        app.add_plugins(MaterialPlugin::<AtmosphereMaterial>::default());
     }
 }
