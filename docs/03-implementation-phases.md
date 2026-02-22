@@ -1,6 +1,6 @@
 # Implementation Phases
 
-This is a large architectural shift. We break it into incremental phases where each phase produces a working, runnable program. No phase should leave the project in a broken state for long.
+Each phase produces a working, runnable program. No phase should leave the project in a broken state for long.
 
 ---
 
@@ -8,16 +8,7 @@ This is a large architectural shift. We break it into incremental phases where e
 
 **Goal**: Add floating origin without breaking anything. The planet still renders exactly as before, but now lives in a `big_space` grid cell.
 
-**Tasks**:
-1. ✅ Add `big_space = "0.12.0"` to Cargo.toml
-2. ✅ Add `BigSpaceDefaultPlugins` to the app (replaces `TransformPlugin`)
-3. ✅ Add `CellCoord` to the camera entity, mark it with `FloatingOrigin`
-4. ✅ Add `CellCoord` to planet entities via `spawn_grid_default` / `spawn_spatial`
-5. ✅ Rendering works with big_space
-6. ⚠️ Far-distance precision not explicitly stress-tested yet
-
 **What changed**: `main.rs` (BigSpaceRootBundle, Grid hierarchy, disable TransformPlugin)
-**API notes**: big_space 0.12 uses `CellCoord` (not `GridCell<i64>`), `BigSpaceDefaultPlugins` (not `BigSpacePlugin`), and `BigSpaceRootBundle` for the root entity. See CLAUDE.md for detailed big_space API notes.
 **Deliverable**: Floating origin infrastructure in place, multi-planet spawning works
 
 ---
@@ -26,15 +17,7 @@ This is a large architectural shift. We break it into incremental phases where e
 
 **Goal**: Extract planet-related code into a `Planet` component/plugin so we can spawn multiple planets.
 
-**Tasks**:
-1. ✅ Create `planet.rs` with `Planet` component (holds TerrainConfig)
-2. ✅ Create `PlanetPlugin` (registered, currently empty — systems live in lod.rs)
-3. ✅ Planet spawning in `main.rs` setup_scene (Earth + Moon)
-4. ✅ Two planets (Earth + Moon) with different terrain configs, radii, and materials
-5. ✅ LOD systems operate per-planet — `update_lod` queries `With<Planet>`, each planet has its own `PlanetQuadtree`
-
 **What changed**: New `planet.rs`, `lod.rs` (per-planet queries, `ChunkNode.planet` field), `main.rs` (multi-planet setup)
-**Note**: Atmosphere scrapped for now — will be re-added much later after the terrain pipeline rewrite.
 **Deliverable**: Two planets with independent LOD, terrain, and materials
 
 ---
@@ -43,211 +26,155 @@ This is a large architectural shift. We break it into incremental phases where e
 
 **Goal**: Planets orbit a central star. The sun becomes a physical entity at the origin, and each planet moves along a Keplerian orbit.
 
-**Tasks**:
-1. ✅ Create `orbit.rs` with `Orbit` component:
-   - Full Keplerian parameters (semi-major axis, eccentricity, inclination, LAN, arg of periapsis, period, initial mean anomaly)
-   - `OrbitalTime` resource with speed multiplier
-   - `update_orbits` system: f64 Keplerian solver → `Grid::translation_to_grid()` → CellCoord + Transform
-   - Hierarchical orbits via `parent: Option<Entity>` — resolved same-frame (no 1-frame lag)
-2. ✅ Sun as a visible entity:
-   - Emissive sphere mesh at origin with `Sun` marker component
-   - Spawned via `spawn_spatial` in the root grid
-3. ⬚ Per-planet `sun_direction` — **deferred (atmosphere scrapped for now)**
-4. ⬚ Dynamic `DirectionalLight` tracking — **deferred, light still hardcoded at (5000, 5000, 5000)**
-5. ✅ Camera tracking hotkeys: hold 1/2/3 to smoothly track Sun/Earth/Moon
-6. ✅ Test: Moon orbits Earth, Earth orbits Sun, visible from camera child of Earth
-
 **What changed**: New `orbit.rs`, `main.rs` (Sun entity, micro-scale test system, camera tracking hotkeys)
-**Remaining gaps**:
-- Directional light doesn't track the Sun (terrain lit from fixed direction)
-- No time control keyboard shortcuts (speed is set to 1.0 in code)
-- Per-planet sun_direction deferred (atmosphere scrapped for now, will revisit later)
-
-**Key implementation detail**: Orbital positions (in world units / km) must be converted to CellCoord via `Grid::translation_to_grid()`, NOT via `floor()`. `Grid::default()` has `cell_edge_length = 2000`, so naive `floor()` places entities 2000x too far apart.
-
-**Current test system** (micro scale for visual verification):
-- Sun: radius 2000, at origin
-- Earth: radius 1000, orbit 15,000 km, period 30s
-- Moon: radius 300, orbit 4,000 km around Earth, period 10s
-- Camera: child of Earth, 8,000 km above surface
-
 **Deliverable**: Planets visibly orbiting a central star with hierarchical orbit support
 
 ---
 
-## Phase 2: Density Field
+## Phase 2: SDF Rendering Foundation
 
-**Goal**: Replace heightmap terrain with a density field. Still using the existing quadtree/surface mesh for now — the density field just drives elevation.
-
-**Tasks**:
-1. Create `density.rs` with a `DensityField` trait:
-   ```rust
-   pub trait DensityField: Send + Sync {
-       fn sample(&self, pos: Vec3) -> f32;        // negative = inside
-       fn gradient(&self, pos: Vec3) -> Vec3;      // for normals
-   }
-   ```
-2. Implement `SphericalDensity` — base sphere + noise layers (port from `TerrainConfig`)
-3. Refactor `TerrainConfig::get_displaced_position()` to use the density field internally
-4. Verify terrain looks the same as before (density field wrapping the existing noise)
-5. Add a simple cave/overhang noise layer to prove the density field can represent non-heightmap geometry (this will look broken with the quadtree mesh — that's expected and motivates Phase 3)
-
-**What changes**: New `density.rs`, `terrain.rs` (refactored to use density)
-**What doesn't change**: Quadtree, chunk mesh, LOD, atmosphere, camera
-**Risk**: Low — the density field is a pure data abstraction, doesn't affect rendering pipeline
-**Deliverable**: Same terrain appearance (validating density field correctness), plus a demonstration of cave geometry that shows why we need volumetric meshing
-
----
-
-## Phase 3: Octree Data Structure
-
-**Goal**: Build the sparse octree that will replace the quadtree for LOD management.
+**Goal**: Replace the mesh-based terrain pipeline with GPU raymarching. A single planet rendered via sphere tracing with basic noise terrain.
 
 **Tasks**:
-1. Create `octree.rs` with core types:
-   - `OctreeNodeId` — uniquely identifies a node (depth + position)
-   - `OctreeNode` — Leaf or Split(children)
-   - `SparseOctree` — HashMap-based tree (similar to current `FaceQuadtree` pattern)
-2. Implement octree operations:
-   - `split(node)`, `merge(node)`, `children(node)`, `parent(node)`
-   - `neighbors(node)` — 6-face, 12-edge, 8-corner adjacency
-   - `bounds(node)` -> AABB in local planet space
-   - `contains_surface(node, density_field)` -> bool (sign change detection)
-3. Implement screen-space error metric (adapt from current `lod.rs`):
-   - `geometric_error = node_size / CHUNK_RESOLUTION`
-   - `pixel_error = geometric_error / distance * PERSPECTIVE_SCALE`
-4. Unit tests for octree operations, especially neighbor lookups
-5. **Do not yet integrate with rendering** — this is pure data structure work
+1. Create `assets/shaders/noise.wgsl` — 3D simplex noise (port of Ashima/webgl-noise)
+2. Create `assets/shaders/planet_sdf.wgsl` — sphere tracing + FBM displacement + Lambertian lighting + distance-based octave LOD
+3. Create `src/planet_material.rs` — Bevy `Material` impl with `PlanetSdfUniforms`, pipeline specialization (no cull, depth write, opaque, no frustum culling)
+4. Update `src/planet.rs` — replace `TerrainConfig` with `SdfConfig` (noise parameters as Rust struct)
+5. Update `src/main.rs` — spawn terrain icosphere mesh per planet with `PlanetMaterial`
+6. Remove `src/terrain.rs`, `src/quadtree.rs`, `src/chunk_mesh.rs`, `src/lod.rs`, `src/mesh_task.rs`
 
-**What changes**: New `octree.rs`
-**What doesn't change**: Everything else still uses the quadtree
-**Risk**: Low — new code with no integration yet
-**Deliverable**: Tested octree data structure ready for LOD integration
+**What changes**: New `planet_material.rs`, new WGSL shaders, adapted `planet.rs` + `main.rs`
+**What gets removed**: `terrain.rs`, `quadtree.rs`, `chunk_mesh.rs`, `lod.rs`, `mesh_task.rs`
+**Risk**: Medium — new shader pipeline, but pattern proven by existing atmosphere shader
+**Deliverable**: Bumpy spherical planet rendered via raymarching, more detail as you zoom in
 
 ---
 
-## Phase 4: Surface Extraction
+## Phase 3: Terrain Quality + Lighting
 
-**Goal**: Generate meshes from the density field within octree leaf nodes using Dual Contouring or Marching Cubes.
+**Goal**: Terrain that looks like real geography, properly lit.
 
 **Tasks**:
-1. Add `isosurface = "0.1.0-alpha.0"` to Cargo.toml
-2. Create `surface_extraction.rs`:
-   - Implement the `isosurface` Source trait for our `DensityField`
-   - Function: `extract_mesh(density_field, node_bounds, resolution) -> Mesh`
-   - Support both DC and MC (feature flag or runtime switch)
-3. Adapt output to Bevy `Mesh`:
-   - Vertex positions, normals, indices
-   - UV coordinates (triplanar projection from world position)
-4. Async mesh generation (adapt `mesh_task.rs` pattern)
-5. Test with a standalone sphere density to verify correct meshes
-6. Test with the noise-perturbed planet density to verify terrain quality
+1. Add terrain building blocks to WGSL: ridge noise, domain warping
+2. Tune continental-scale noise for realistic landmass shapes
+3. SDF gradient normals (finite differences, epsilon scaled by distance)
+4. Dynamic sun direction from orbital position (`DirectionalLight` tracks sun entity)
+5. Correct `frag_depth` output for depth buffer integration
+6. Multi-planet rendering: Earth + Moon with different SDF configs
 
-**What changes**: New `surface_extraction.rs`, `mesh_task.rs` (adapted), Cargo.toml
-**What doesn't change**: Still using quadtree for rendering; this is building the replacement pipeline
-**Risk**: Medium — isosurface crate API may need adaptation, mesh quality tuning needed
-**Deliverable**: Ability to generate correct meshes from density fields, not yet wired into rendering
+**What changes**: `planet_sdf.wgsl` (new noise functions, lighting), `planet_material.rs` (uniform updates), `main.rs` (light tracking)
+**Risk**: Low — iterative shader improvement
+**Deliverable**: Multiple planets with distinct, realistic terrain lit by the sun
 
 ---
 
-## Phase 5: Octree LOD System (The Big Switch)
+## Phase 4: Terrain Coloring + Biomes
 
-**Goal**: Replace the quadtree LOD system with the octree LOD system. This is the most impactful phase.
+**Goal**: Planets with visual variety — oceans, grasslands, mountains, snow.
 
 **Tasks**:
-1. Create `planet_lod.rs` — octree-based LOD systems:
-   - `update_octree_lod` — evaluate screen error, split/merge decisions
-   - `sync_octree_chunks` — spawn/despawn chunk entities for leaf nodes
-   - `request_octree_meshes` — trigger async mesh generation for new leaves
-   - `poll_octree_meshes` — collect completed meshes
-2. Chunk entity structure:
-   - `OctreeChunk { planet: Entity, node_id: OctreeNodeId }`
-   - `PendingMesh(Task<Mesh>)` (same pattern as current)
-   - `RetainUntilChildrenReady` (same pattern)
-3. Only mesh leaves that contain the surface (skip fully inside/outside nodes)
-4. Apply per-planet material (initially `StandardMaterial` with vertex colors or triplanar texturing)
-5. Wire into the Bevy schedule, replacing the old quadtree systems
-6. Remove old quadtree systems from the schedule (keep files for reference initially)
+1. Elevation-based coloring (ocean blue, lowland green, mountain gray, snow caps)
+2. Slope-based coloring (steep cliffs vs flat surfaces)
+3. Latitude-based variation (polar ice, tropical zones)
+4. Per-planet color palette (Earth-like, Mars-like, Moon-like)
+5. Ocean rendering (flat water plane within the SDF, specular reflections)
 
-**What changes**: New `planet_lod.rs`, `main.rs` (system registration), old `lod.rs` disabled
-**What gets removed (eventually)**: `quadtree.rs`, `chunk_mesh.rs`, `lod.rs`, `terrain.rs`
-**Risk**: High — this is the critical switchover. Plan for a period where the old and new systems coexist.
-**Deliverable**: Planet rendered via octree + density field + surface extraction
+**What changes**: `planet_sdf.wgsl` (coloring functions), `planet_material.rs` (color config uniforms)
+**Risk**: Low — shader art iteration
+**Deliverable**: Visually distinct, colorful planets
 
 ---
 
-## Phase 6: Seam Stitching
+## Phase 5: Atmosphere Re-integration
 
-**Goal**: Eliminate cracks between chunks at different LOD levels.
+**Goal**: The existing atmosphere shader working with SDF terrain.
 
 **Tasks**:
-1. Evaluate approaches:
-   - **Transvoxel** (Lengyel): transition cells at LOD boundaries — cleanest results
-   - **Skirt geometry**: extend edges below surface — simplest to implement
-   - **Boundary agreement**: force adjacent chunks to share boundary samples — moderate complexity
-2. Implement chosen approach in `seam.rs`
-3. Integrate with mesh generation pipeline (seam info passed alongside density samples)
-4. Verify visually: fly around the planet looking for cracks at LOD boundaries
-5. Stress test: rapid camera movement to force frequent LOD transitions
+1. Re-add atmosphere entities per planet (icosphere + `AtmosphereMaterial`)
+2. Camera gets `DepthPrepass` component — atmosphere shader reads terrain depth
+3. Verify atmosphere correctly clips at terrain surface (no sky below ground)
+4. Dynamic sun direction in atmosphere uniforms from orbital positions
+5. Multi-planet atmospheres (Earth has one, Moon doesn't)
 
-**What changes**: New `seam.rs`, `surface_extraction.rs` (boundary handling)
-**Risk**: Medium — seam stitching is a known hard problem, but well-documented solutions exist
-**Deliverable**: Visually seamless LOD transitions
+**What changes**: `main.rs` (atmosphere entity spawning), `atmosphere.rs` (sun direction update system)
+**Risk**: Low — atmosphere shader already supports depth prepass
+**Deliverable**: Planets with terrain + atmosphere
 
 ---
 
-## Phase 7: Polish and Cleanup
+## Phase 6: Volumetric Features
 
-**Goal**: Remove legacy code, optimize performance, add planetary system features.
+**Goal**: Terrain that heightmaps can't do — caves, overhangs, arches.
 
 **Tasks**:
-1. Delete old files: `quadtree.rs`, `chunk_mesh.rs`, `lod.rs`, `terrain.rs` (if not already done)
-2. Update `CLAUDE.md` with new architecture documentation
-3. Performance tuning:
-   - Chunk generation budget per frame
-   - LOD distance thresholds
-   - Mesh resolution per chunk
-4. Add per-planet configuration variety:
-   - Different noise parameters
-   - Different radii
-   - Different atmosphere colors/densities
-5. Create a demo planetary system (earth-like planet + moon + rocky planet)
+1. Cave carving in WGSL (3D noise threshold + Boolean subtraction)
+2. Overhang generation (domain-warped noise displacing the surface laterally)
+3. Tune parameters for natural-looking cave entrances
+4. Test and adjust raymarching convergence inside caves (may need more steps or bi-directional marching)
+5. Expose cave/overhang parameters in Rust `SdfConfig`
+
+**What changes**: `planet_sdf.wgsl` (cave functions), `planet_material.rs` (cave config uniforms)
+**Risk**: Medium — ray marching inside caves requires careful tuning for convergence
+**Deliverable**: Fly into caves, walk under arches
 
 ---
 
-## Phase 8 (Future): Physics
+## Phase 7: Performance + Polish
 
-**Goal**: Enable physics interactions on planet surfaces.
+**Goal**: Smooth performance at all scales, demo-ready.
 
 **Tasks**:
-1. Evaluate physics crates (`avian` for Bevy 0.18, or `bevy_rapier`)
-2. Generate collision meshes from chunk meshes (can be lower resolution)
-3. Only generate colliders for chunks near physical entities
-4. Handle collider updates when LOD changes
-5. Gravity toward planet center based on distance
+1. Profile shader — optimize noise evaluation, tune step count vs quality
+2. Early ray termination (fragments behind planet, beyond max distance)
+3. Bounding sphere optimization for multi-planet (skip planets too far for detail)
+4. Screen-space adaptive step size
+5. Demo planetary system: Earth-like + Moon + rocky planet with craters
+
+**What changes**: Shader optimization, `main.rs` (demo system configuration)
+**Risk**: Low — optimization and tuning
+**Deliverable**: Polished, performant planetary system
 
 ---
 
-## Recommended Next Step
+## Phase 8 (Future): Physics via JIT Local Meshing
 
-**Phases 0, 1, and 1.5 are complete.** The next step is **Phase 2** (density field) or **Phase 3** (octree), which can be developed in parallel. The multi-planet + orbital infrastructure is in place, so the new density/octree system can be tested on the second planet (Moon) while keeping Earth on the old quadtree system.
+**Goal**: Physical objects can interact with terrain.
+
+**Tasks**:
+1. Duplicate the SDF composition in Rust (must match WGSL output exactly)
+2. Small 3D grid around physics objects, evaluate density on CPU
+3. Marching Cubes on the CPU grid -> invisible collision mesh
+4. Feed to physics engine (avian/rapier)
+5. Tiered simulation: full physics near player, simplified at mid-range, frozen at distance
+
+**What changes**: New `density.rs` (CPU SDF), new `physics_mesh.rs` (JIT meshing), physics crate dependency
+**Risk**: High — CPU/GPU SDF parity, physics integration complexity
+**Deliverable**: Walk on the planet surface, physics objects land on terrain
 
 ---
 
-## Parallel Work Opportunities
-
-Some phases have independent sub-tasks that can be developed in parallel:
-
-- **Phase 2 (density) + Phase 3 (octree)**: These are independent data structures. The density field doesn't depend on the octree, and vice versa. Both can be built and tested in isolation before they're combined in Phase 4.
-- **Phase 4 (surface extraction)** depends on both Phase 2 and Phase 3.
-- **Phase 6 (seam stitching)** can be researched during Phases 3-5.
+## Phase Dependency Graph
 
 ```
-Phase 0 ✅ ──> Phase 1 ✅ ──┬──> Phase 1.5 ✅ (orbits)
-                             │
-                             ├──> Phase 2 (density) ──┬──> Phase 4 ──> Phase 5 ──> Phase 6 ──> Phase 7
-                             │                        │
-                             └──> Phase 3 (octree) ───┘
+Phase 0 done --> Phase 1 done --> Phase 1.5 done (orbits)
+                                       |
+                                       v
+                                  Phase 2 (SDF foundation)
+                                       |
+                                       v
+                                  Phase 3 (terrain quality + lighting)
+                                       |
+                                       v
+                              Phase 4 (coloring) -----> Phase 5 (atmosphere)
+                                       |                      |
+                                       v                      v
+                                  Phase 6 (volumetric features)
+                                       |
+                                       v
+                                  Phase 7 (performance + polish)
+                                       |
+                                       v
+                                  Phase 8 (physics, future)
 ```
 
-Phases 0, 1, and 1.5 are complete. Phase 2 (density) and Phase 3 (octree) can be developed in parallel.
+Phases 4 and 5 can be developed in parallel (coloring doesn't depend on atmosphere, and vice versa). Phase 6 benefits from both being complete.

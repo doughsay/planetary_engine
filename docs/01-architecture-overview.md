@@ -1,167 +1,141 @@
-# Architecture Overview: Density Field Planetary Engine
+# Architecture Overview: SDF Planet Rendering Engine
 
 ## Vision
 
-Transform the current quadtree-based heightmap planet renderer into a volumetric density field engine capable of rendering an entire planetary system with multiple planets, caves, overhangs, and arbitrary terrain topology — all at scales ranging from orbital views down to walking on the surface.
+Transform the current quadtree-based heightmap planet renderer into an SDF raymarching engine capable of rendering an entire planetary system with caves, overhangs, and arbitrary terrain topology — all at scales ranging from orbital views down to walking on the surface, with effectively infinite detail.
 
 ## Current Architecture vs Target
 
-### What We Have Now
+### What We Have Now (Phases 0, 1, 1.5 complete)
 
 - **Quadtree LOD** on 6 cube faces, projected to a sphere
 - **Heightmap terrain** — single elevation per point, no caves/overhangs
-- **Single planet** with atmosphere, starfield, galaxy backdrop
-- **f32 precision** — works fine for one planet (radius 6360 km) but will break at interplanetary scales
+- **Multiple planets** with per-planet LOD and materials
+- **Floating origin** via `big_space` — grid cells for interplanetary scales
+- **Orbital mechanics** — Keplerian solver, hierarchical orbits
+- **Starfield + Galaxy backdrop** — procedural rendering
 - **2D surface mesh** — vertices displaced along sphere normals
 
 ### What We're Building
 
-- **Octree LOD** — 3D spatial subdivision, not limited to surface
-- **Density field** — implicit function defining inside/outside, enabling caves, overhangs, arches, floating rocks
-- **Surface extraction** via Dual Contouring (primary) and/or Marching Cubes (fallback)
-- **Multiple planets** — planetary system with different terrain configs per body
-- **Floating origin** via `big_space` — 128-bit precision grid cells for interplanetary travel
-- **Physics-ready surfaces** — extracted meshes suitable for collision geometry
-- **Seamless LOD transitions** — no visible cracks between different-resolution chunks
+- **SDF raymarching** — terrain evaluated per-pixel on the GPU, no mesh generation
+- **Signed Distance Field** — implicit function defining terrain shape, enabling caves, overhangs, arches
+- **Distance-based LOD** — noise octaves scale with camera distance (implicit, no octree management)
+- **Parameterized terrain** — WGSL building blocks driven by Rust configuration
+- **Atmosphere integration** — existing atmosphere shader reads SDF depth for correct clipping
+- **Physics-ready path** — future JIT local meshing for collision geometry
 
 ## Core Architectural Pillars
 
-### 1. Density Field (replaces `TerrainConfig`)
+### 1. SDF Evaluation (replaces `TerrainConfig`)
 
-A density function `f(x, y, z) -> f32` where:
+A signed distance function `sdf(p) -> f32` where:
 - Negative = inside solid
 - Positive = outside (air)
 - Zero = surface
 
-For a planet, the base density is `length(pos - center) - radius`, modified by noise layers for terrain features. This naturally handles:
-- Mountains (negative noise pushes surface outward)
-- Caves (positive bubbles inside the planet)
-- Overhangs (laterally-displaced noise)
+For a planet: `sdf(p) = length(p - center) - radius - terrain_noise(normalize(p - center))`, modified by noise layers. This naturally handles:
+- Mountains (noise pushes surface outward)
+- Caves (3D noise carving interior volumes via Boolean subtraction)
+- Overhangs (domain-warped noise)
 - Multiple planets (different center/radius/noise per planet)
 
-### 2. Octree LOD (replaces `FaceQuadtree`)
+The SDF is evaluated entirely in WGSL. Rust controls the configuration (frequencies, amplitudes, layer enables) via uniform buffers.
 
-A sparse octree per planet, rooted at the planet's bounding cube:
-- Subdivides based on camera distance (screen-space error, similar to current approach)
-- Only subdivides nodes that contain the surface (density sign change)
-- Leaf nodes are meshed via surface extraction
-- Max depth determines ground-level resolution
+### 2. Sphere-Mesh Raymarching (replaces quadtree + chunk mesh)
 
-### 3. Surface Extraction (replaces `chunk_mesh.rs`)
+Each planet spawns an icosphere mesh at its bounding radius (planet_radius + max_elevation). The fragment shader:
 
-Each octree leaf node samples its density field on a regular grid and extracts a mesh:
-- **Dual Contouring** (preferred): produces sharp features, fewer triangles, quad-dominant
-- **Marching Cubes** (fallback): simpler, more robust, triangle-only
+1. Computes a ray from camera through the fragment
+2. Sphere-traces inward using the SDF to guide step sizes
+3. Finds the terrain surface (SDF = 0)
+4. Computes normals via SDF gradient (finite differences)
+5. Lights the surface and outputs color + depth
 
-The `isosurface` crate provides both algorithms with zero dependencies.
+This is the same rendering pattern as the existing atmosphere shader. No mesh generation, no octree, no seam stitching.
 
-### 4. Floating Origin via `big_space` (new)
+### 3. Distance-Based Octave LOD (replaces octree LOD system)
 
-`big_space` 0.12 (Bevy 0.18 compatible) provides:
-- `GridCell<i64>` or `GridCell<i128>` components on every entity
-- `FloatingOrigin` marker on the camera
-- Automatic recentering when camera crosses cell boundaries
-- Standard Bevy `Transform` for local offsets within cells
+The number of FBM noise octaves evaluated scales automatically with distance:
+- Each octave's feature size is compared to the pixel size at the current distance
+- Sub-pixel octaves are skipped (they'd be invisible anyway)
+- At orbital distance: 2-3 octaves (smooth sphere with continents)
+- At mountain scale: 6-8 octaves (mountain ridges, valleys)
+- At ground level: 12-16 octaves (rocks, small features)
 
-This solves f32 precision at interplanetary scales without custom matrix math.
+No explicit LOD management needed. The shader handles it automatically.
 
-### 5. Multi-Planet System with Orbital Mechanics (new)
+### 4. Floating Origin via `big_space` (complete)
 
-A central star sits at the grid origin. Planets orbit it via Keplerian mechanics:
-- `Star` entity at `GridCell(0, 0, 0)` — the system's center of mass
-- `Planet` component with density config, radius, atmosphere settings
-- `Orbit` component with semi-major axis, eccentricity, inclination, period
-- Hierarchical orbits: moons orbit planets, planets orbit the star
-- Own octree, own set of chunk entities per planet
-- Own atmosphere mesh entity (existing system adapts naturally)
-- Sun direction computed dynamically per planet from `star_pos - planet_pos`
-- Time control resource for speeding up/pausing orbital motion
+`big_space` 0.12 provides grid-cell positioning for interplanetary scales. Already integrated in Phases 0/1.
 
-### 6. Seam Stitching (replaces current neighbor-snapping)
+### 5. Multi-Planet System with Orbital Mechanics (complete)
 
-When adjacent octree leaves are at different LOD levels, the boundary between them needs stitching to prevent cracks. Approaches:
-- **Transition cells** (Lengyel's Transvoxel): special cell configurations at LOD boundaries
-- **Skirt geometry**: extend chunk edges downward to hide gaps (simpler but less clean)
-- **Shared boundary sampling**: ensure adjacent chunks agree on boundary density values
+Keplerian orbital mechanics with hierarchical orbits. Already integrated in Phase 1.5.
 
-### 7. Physics Integration (new, future)
+### 6. Physics Integration (future, JIT Local Meshing)
 
-Extracted surface meshes can be used directly as collision geometry:
-- Mesh collider generation from chunk meshes
-- Only generate colliders for chunks near the player/objects
-- Collider LOD can be coarser than visual LOD
+When physics is needed (Phase 8), the approach is:
+- Duplicate the SDF composition in Rust (same math as WGSL)
+- For physics objects, evaluate the SDF on a small 3D grid around the object on the CPU
+- Extract collision geometry via Marching Cubes
+- Feed the invisible mesh to the physics engine
+- Tiered simulation: full physics near player, simplified at mid-range, frozen at distance
+
+See `SDF-vs-surface-extraction.md` for detailed analysis of this approach.
 
 ## System Diagram
 
 ```
-                    ┌─────────────────────┐
-                    │   big_space Grid     │
-                    │  (FloatingOrigin)    │
-                    └──────────┬──────────┘
-                               │
-                        ┌──────▼──────┐
-                        │    Star     │
-                        │ GridCell(0) │
-                        └──────┬──────┘
-                               │ Keplerian orbits
-              ┌────────────────┼────────────────┐
-              │                │                │
-        ┌─────▼─────┐   ┌─────▼─────┐   ┌─────▼─────┐
-        │  Planet A  │   │  Planet B  │   │  Planet C  │
-        │  (Earth)   │   │  (Moon←A)  │   │  (Mars)    │
-        └─────┬──────┘   └─────┬──────┘   └─────┬──────┘
-              │                │                │
-        ┌─────▼──────┐  ┌─────▼──────┐  ┌─────▼──────┐
-        │  Octree     │  │  Octree     │  │  Octree     │
-        │  LOD System │  │  LOD System │  │  LOD System │
-        └─────┬──────┘  └─────┬──────┘  └─────┬──────┘
-              │                │                │
-        ┌─────▼──────┐  ┌─────▼──────┐  ┌─────▼──────┐
-        │  Density    │  │  Density    │  │  Density    │
-        │  Field      │  │  Field      │  │  Field      │
-        └─────┬──────┘  └─────┬──────┘  └─────┬──────┘
-              │                │                │
-        ┌─────▼──────┐  ┌─────▼──────┐  ┌─────▼──────┐
-        │  Surface    │  │  Surface    │  │  Surface    │
-        │  Extraction │  │  Extraction │  │  Extraction │
-        │  (DC / MC)  │  │  (DC / MC)  │  │  (DC / MC)  │
-        └─────┬──────┘  └─────┬──────┘  └─────┬──────┘
-              │                │                │
-        ┌─────▼──────┐  ┌─────▼──────┐  ┌─────▼──────┐
-        │  Chunk      │  │  Chunk      │  │  Chunk      │
-        │  Meshes     │  │  Meshes     │  │  Meshes     │
-        └─────┬──────┘  └─────┬──────┘  └─────┬──────┘
-              │                │                │
-        ┌─────▼──────┐  ┌─────▼──────┐
-        │  Atmosphere │  │            │  (optional per planet)
-        │  Shell      │  └────────────┘
-        └────────────┘
+                    +---------------------+
+                    |   big_space Grid    |
+                    |  (FloatingOrigin)   |
+                    +----------+----------+
+                               |
+                        +------v------+
+                        |    Star     |
+                        | CellCoord(0)|
+                        +------+------+
+                               | Keplerian orbits
+              +----------------+----------------+
+              |                |                |
+        +-----v-----+   +-----v-----+   +-----v-----+
+        |  Planet A  |   |  Planet B  |   |  Planet C  |
+        |  (Earth)   |   |  (Moon<-A) |   |  (Mars)    |
+        +-----+------+   +-----+------+   +-----+------+
+              |                |                |
+        +-----v------+  +-----v------+  +-----v------+
+        | SDF Shader  |  | SDF Shader  |  | SDF Shader  |
+        | (per-pixel  |  | (per-pixel  |  | (per-pixel  |
+        |  raymarch)  |  |  raymarch)  |  |  raymarch)  |
+        +-----+------+  +-----+------+  +-----+------+
+              |                |                |
+        +-----v------+  +-----v------+
+        | Atmosphere  |  |            |  (optional per planet)
+        | (raymarch)  |  +------------+
+        +------------+
 ```
 
 ## What We Keep
 
-- **Camera system** (`camera.rs`) — 6DOF controls, mostly unchanged (add `big_space` integration)
-- **Atmosphere shader** (`atmosphere.rs` + `atmosphere.wgsl`) — per-planet sphere mesh approach works perfectly for multi-planet
+- **Camera system** (`camera.rs`) — 6DOF controls, unchanged
 - **Starfield** (`starfield.rs` + `starfield.wgsl`) — unchanged
 - **Galaxy** (`galaxy.rs` + `galaxy.wgsl`) — unchanged
-- **Async mesh generation** (`mesh_task.rs`) — pattern stays, implementation changes for new mesh format
+- **Orbital mechanics** (`orbit.rs`) — unchanged
+- **Planet component** (`planet.rs`) — adapted for SDF config
 - **HDR pipeline** — `Exposure::SUNLIGHT` + `AcesFitted` tonemapping stays
+- **Atmosphere concept** — re-integrated with SDF depth output
 
 ## What We Replace
 
-- `terrain.rs` -> `density.rs` (density field evaluation)
-- `quadtree.rs` -> `octree.rs` (3D LOD structure)
-- `chunk_mesh.rs` -> `surface_extraction.rs` (DC/MC meshing)
-- `lod.rs` -> `planet_lod.rs` (octree-based LOD with per-planet octrees)
-- Parts of `main.rs` -> `planet.rs` (planet setup, multi-planet spawning)
+- `terrain.rs` -> removed (terrain noise moves to WGSL)
+- `quadtree.rs` -> removed (no spatial LOD structure needed)
+- `chunk_mesh.rs` -> removed (no mesh generation)
+- `lod.rs` -> removed (LOD is implicit in shader octave count)
+- `mesh_task.rs` -> removed (no async mesh tasks)
 
 ## What We Add
 
-- `big_space` integration for floating origin
-- `planet.rs` — planet components, spawning, configuration
-- `orbit.rs` — Keplerian orbital mechanics, hierarchical orbits, time control
-- `density.rs` — density field trait + implementations
-- `octree.rs` — sparse octree data structure
-- `surface_extraction.rs` — DC/MC mesh generation
-- `seam.rs` — LOD boundary stitching
-- Eventually: physics collider generation
+- `planet_material.rs` — Bevy `Material` for SDF terrain rendering
+- `assets/shaders/noise.wgsl` — reusable 3D simplex noise library
+- `assets/shaders/planet_sdf.wgsl` — terrain SDF, sphere tracing, lighting, coloring
