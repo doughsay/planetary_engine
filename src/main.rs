@@ -115,6 +115,7 @@ fn setup_scene(
         noise_lacunarity: 2.0,
         noise_persistence: 0.5,
         noise_octaves: 14,
+        ..Default::default()
     };
 
     let planet_material_handle = planet_materials.add(PlanetMaterial {
@@ -130,6 +131,7 @@ fn setup_scene(
         noise_lacunarity: 2.0,
         noise_persistence: 0.5,
         noise_octaves: 14,
+        ..Default::default()
     };
 
     let satellite_material_handle = planet_materials.add(PlanetMaterial {

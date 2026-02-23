@@ -18,6 +18,23 @@ struct PlanetSdfUniforms {
     noise_octaves: u32,
     // 0 = normal, 1 = octave count, 2 = ray steps, 3 = normals
     debug_mode: u32,
+    // Crater system
+    crater_enabled: u32,
+    crater_frequency_0: f32,
+    crater_depth_0: f32,
+    crater_rim_height_0: f32,
+    crater_peak_height_0: f32,
+    crater_density_0: f32,
+    crater_frequency_1: f32,
+    crater_depth_1: f32,
+    crater_rim_height_1: f32,
+    crater_peak_height_1: f32,
+    crater_density_1: f32,
+    crater_frequency_2: f32,
+    crater_depth_2: f32,
+    crater_rim_height_2: f32,
+    crater_peak_height_2: f32,
+    crater_density_2: f32,
 }
 
 @group(#{MATERIAL_BIND_GROUP}) @binding(0)
