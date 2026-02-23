@@ -21,17 +21,17 @@ use orbit::{Orbit, OrbitPlugin, OrbitalTime};
 pub struct Sun;
 
 #[derive(Component)]
-struct Moon;
+pub struct Satellite;
 
 /// MICRO SCALE constants for easy verification.
 const SUN_RADIUS: f32 = 2000.0;
-const EARTH_RADIUS: f32 = 1000.0;
-const EARTH_ORBIT_RADIUS: f64 = 15000.0;
-const EARTH_PERIOD: f64 = 30.0; // 30 second year
+const PLANET_RADIUS: f32 = 1000.0;
+const PLANET_ORBIT_RADIUS: f64 = 15000.0;
+const PLANET_PERIOD: f64 = 30.0; // 30 second year
 
-const MOON_RADIUS: f32 = 300.0;
-const MOON_ORBIT_RADIUS: f64 = 4000.0;
-const MOON_PERIOD: f64 = 10.0; // 10 second month
+const SATELLITE_RADIUS: f32 = 300.0;
+const SATELLITE_ORBIT_RADIUS: f64 = 4000.0;
+const SATELLITE_PERIOD: f64 = 10.0; // 10 second month
 
 const SUN_POSITION: Vec3 = Vec3::ZERO;
 
@@ -106,9 +106,9 @@ fn setup_scene(
         ));
     }
 
-    // ── Earth ────────────────────────────────────────────────────────────
-    let earth_sdf = SdfConfig {
-        radius: EARTH_RADIUS,
+    // ── Planet ────────────────────────────────────────────────────────────
+    let planet_sdf_config = SdfConfig {
+        radius: PLANET_RADIUS,
         max_elevation: 50.0,
         noise_frequency: 4.0,
         noise_amplitude: 50.0,
@@ -117,13 +117,13 @@ fn setup_scene(
         noise_octaves: 14,
     };
 
-    let earth_material_handle = planet_materials.add(PlanetMaterial {
+    let planet_material_handle = planet_materials.add(PlanetMaterial {
         uniforms: PlanetSdfUniforms::default(),
     });
 
-    // ── Moon ─────────────────────────────────────────────────────────────
-    let moon_sdf = SdfConfig {
-        radius: MOON_RADIUS,
+    // ── Satellite ─────────────────────────────────────────────────────────
+    let satellite_sdf_config = SdfConfig {
+        radius: SATELLITE_RADIUS,
         max_elevation: 20.0,
         noise_frequency: 8.0,
         noise_amplitude: 20.0,
@@ -132,86 +132,86 @@ fn setup_scene(
         noise_octaves: 14,
     };
 
-    let moon_material_handle = planet_materials.add(PlanetMaterial {
+    let satellite_material_handle = planet_materials.add(PlanetMaterial {
         uniforms: PlanetSdfUniforms::default(),
     });
 
-    let earth_id;
-    let moon_id;
+    let planet_id;
+    let satellite_id;
 
     {
         let mut grid_cmds = commands.grid(root_id, Grid::default());
 
-        earth_id = grid_cmds.spawn_grid_default((
+        planet_id = grid_cmds.spawn_grid_default((
             Transform::default(),
             Visibility::default(),
             planet::Planet {
-                sdf: earth_sdf,
-                material_handle: earth_material_handle.clone(),
+                sdf: planet_sdf_config,
+                material_handle: planet_material_handle.clone(),
             },
             Orbit {
-                semi_major_axis: EARTH_ORBIT_RADIUS,
+                semi_major_axis: PLANET_ORBIT_RADIUS,
                 eccentricity: 0.0,
                 inclination: 0.0,
                 longitude_of_ascending_node: 0.0,
                 argument_of_periapsis: 0.0,
-                period: EARTH_PERIOD,
+                period: PLANET_PERIOD,
                 initial_mean_anomaly: 0.0,
                 parent: None,
             },
         )).id();
 
-        moon_id = grid_cmds.spawn_grid_default((
-            Moon,
+        satellite_id = grid_cmds.spawn_grid_default((
+            Satellite,
             Transform::default(),
             Visibility::default(),
             planet::Planet {
-                sdf: moon_sdf,
-                material_handle: moon_material_handle.clone(),
+                sdf: satellite_sdf_config,
+                material_handle: satellite_material_handle.clone(),
             },
             Orbit {
-                semi_major_axis: MOON_ORBIT_RADIUS,
+                semi_major_axis: SATELLITE_ORBIT_RADIUS,
                 eccentricity: 0.0,
                 inclination: 0.0,
                 longitude_of_ascending_node: 0.0,
                 argument_of_periapsis: 0.0,
-                period: MOON_PERIOD,
+                period: SATELLITE_PERIOD,
                 initial_mean_anomaly: 0.0,
-                parent: Some(earth_id),
+                parent: Some(planet_id),
             },
         )).id();
     }
 
-    // Spawn terrain icosphere as child of Earth
-    commands.entity(earth_id).with_children(|parent| {
+    // Spawn terrain icosphere as child of planet
+    commands.entity(planet_id).with_children(|parent| {
         parent.spawn((
             CellCoord::default(),
             Mesh3d(terrain_mesh.clone()),
-            MeshMaterial3d(earth_material_handle),
+            MeshMaterial3d(planet_material_handle),
             Transform::default(),
             NoFrustumCulling,
         ));
     });
 
-    // Spawn terrain icosphere as child of Moon
-    commands.entity(moon_id).with_children(|parent| {
+    // Spawn terrain icosphere as child of satellite
+    commands.entity(satellite_id).with_children(|parent| {
         parent.spawn((
             CellCoord::default(),
             Mesh3d(terrain_mesh.clone()),
-            MeshMaterial3d(moon_material_handle),
+            MeshMaterial3d(satellite_material_handle),
             Transform::default(),
             NoFrustumCulling,
         ));
     });
 
-    // Camera as child of Earth
-    commands.entity(earth_id).with_children(|parent| {
+    // Camera as child of planet
+    commands.entity(planet_id).with_children(|parent| {
         parent.spawn((
             CellCoord::default(),
             Camera3d::default(),
             bevy::core_pipeline::prepass::DepthPrepass,
-            // Position camera slightly further back to see the Moon pass by
-            Transform::from_xyz(0.0, 0.0, EARTH_RADIUS + 8000.0).looking_at(Vec3::ZERO, Vec3::Y),
+            // Position camera further back to see the satellite pass by
+            Transform::from_xyz(0.0, 0.0, PLANET_RADIUS + 8000.0).looking_at(Vec3::ZERO, Vec3::Y),
             Projection::Perspective(PerspectiveProjection {
                 far: 1_000_000.0,
                 near: 1.0,
@@ -238,7 +238,7 @@ fn camera_tracking_hotkeys(
     input: Res<ButtonInput<KeyCode>>,
     time: Res<Time>,
     mut camera_q: Query<(&mut Transform, &GlobalTransform, &mut SpaceCameraState), With<Camera3d>>,
-    targets_q: Query<(&GlobalTransform, Has<Sun>, Has<Moon>, Has<planet::Planet>), Without<Camera3d>>,
+    targets_q: Query<(&GlobalTransform, Has<Sun>, Has<Satellite>, Has<planet::Planet>), Without<Camera3d>>,
 ) {
     let mut target_pos: Option<Vec3> = None;
 
@@ -247,12 +247,12 @@ fn camera_tracking_hotkeys(
             if is_sun { target_pos = Some(global.translation()); break; }
         }
     } else if input.pressed(KeyCode::Digit2) {
-        for (global, _, is_moon, is_planet) in &targets_q {
-            if is_planet && !is_moon { target_pos = Some(global.translation()); break; }
+        for (global, _, is_satellite, is_planet) in &targets_q {
+            if is_planet && !is_satellite { target_pos = Some(global.translation()); break; }
         }
     } else if input.pressed(KeyCode::Digit3) {
-        for (global, _, is_moon, _) in &targets_q {
-            if is_moon { target_pos = Some(global.translation()); break; }
+        for (global, _, is_satellite, _) in &targets_q {
+            if is_satellite { target_pos = Some(global.translation()); break; }
         }
     }
 
@@ -268,7 +268,7 @@ fn camera_tracking_hotkeys(
         let dir = to_target.normalize();
 
         // Compute desired rotation in parent-local space.
-        // The parent (Earth) has no rotation, so world-space directions
+        // The parent planet has no rotation, so world-space directions
         // are valid in parent-local space.
         let desired_rot = Transform::from_translation(cam_transform.translation)
             .looking_at(cam_transform.translation + dir, Vec3::Y)

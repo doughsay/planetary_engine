@@ -52,14 +52,14 @@ This project uses `big_space` 0.12 for floating-origin precision at interplaneta
 
 ### Entity Hierarchy
 ```
-BigSpaceRootBundle (root_id)          ← has Grid + BigSpace
-  ├── Sun        (spawn_spatial)      ← CellCoord in root grid
-  ├── Light      (spawn_spatial)      ← CellCoord in root grid
-  ├── Earth      (spawn_grid_default) ← CellCoord in root grid + OWN Grid for children
-  │   └── Chunks (children)           ← CellCoord in Earth's sub-grid
+BigSpaceRootBundle (root_id)              ← has Grid + BigSpace
+  ├── Sun            (spawn_spatial)      ← CellCoord in root grid
+  ├── Light          (spawn_spatial)      ← CellCoord in root grid
+  ├── Planet         (spawn_grid_default) ← CellCoord in root grid + OWN Grid for children
+  │   └── Chunks (children)              ← CellCoord in planet's sub-grid
   │   └── Camera (child, FloatingOrigin)
-  └── Moon       (spawn_grid_default) ← CellCoord in root grid + OWN Grid for children
-      └── Chunks (children)           ← CellCoord in Moon's sub-grid
+  └── Satellite      (spawn_grid_default) ← CellCoord in root grid + OWN Grid for children
+      └── Chunks (children)              ← CellCoord in satellite's sub-grid
 ```
 
 ### Critical: Position ↔ CellCoord Conversion
@@ -82,7 +82,7 @@ If `grid_q.single()` finds multiple matches it returns `Err` and silently fails.
 - **`spawn_grid_default(bundle)`** — adds `CellCoord + Transform + Grid`. Use for entities whose children need their own grid-cell positioning (planets with chunks as children).
 
 ### Camera as Child Entity
-The camera can be a child of a planet entity (e.g., Earth) with `FloatingOrigin`. big_space computes the camera's absolute grid position by composing parent cells, so the floating origin correctly recenters around the camera's actual world position. The camera's own `CellCoord::default()` is fine — the parent's cell provides the offset.
+The camera can be a child of a planet entity with `FloatingOrigin`. big_space computes the camera's absolute grid position by composing parent cells, so the floating origin correctly recenters around the camera's actual world position. The camera's own `CellCoord::default()` is fine — the parent's cell provides the offset.
 
 ### TransformPlugin
 big_space replaces Bevy's `TransformPlugin`. The app must disable it:
@@ -116,8 +116,8 @@ assets/shaders/
 - 1 world unit = 1 km
 - big_space `Grid::default()` cell_edge_length = 2000 units (2000 km per cell)
 - Current test system uses micro-scale constants (see main.rs):
-  - Sun radius: 2000, Earth radius: 1000, Moon radius: 300
-  - Earth orbit: 15,000 km (30s period), Moon orbit: 4,000 km around Earth (10s period)
+  - Sun radius: 2000, planet radius: 1000, satellite radius: 300
+  - Planet orbit: 15,000 km (30s period), satellite orbit: 4,000 km around planet (10s period)
 - Original single-planet scale: Radius 6360, atmosphere shell 100 km thick
 
 ### SDF Terrain Rendering (`planet_material.rs` + `planet_sdf.wgsl`)
@@ -158,8 +158,8 @@ Terrain is rendered via GPU raymarching on an icosphere mesh per planet. No CPU-
 - `Planet` component on each planet entity holds `SdfConfig` + `material_handle: Handle<PlanetMaterial>`
 - Each planet spawns an icosphere child entity with `PlanetMaterial`
 - Planets are spawned via `spawn_grid_default` (each gets own sub-Grid for children)
-- `Sun` marker component on the star entity, `Moon` marker on the moon
-- Camera tracking hotkeys: hold 1/2/3 to smoothly look at Sun/Earth/Moon
+- `Sun` marker component on the star entity, `Satellite` marker on the satellite
+- Camera tracking hotkeys: hold 1/2/3 to smoothly look at Sun/planet/satellite
 
 ### Orbital Mechanics (`orbit.rs`)
 
@@ -169,7 +169,7 @@ Terrain is rendered via GPU raymarching on an icosphere mesh per planet. No CPU-
   1. Compute local orbital position for each body via Kepler equation (Newton iteration solver)
   2. Resolve parent chains same-frame (no 1-frame lag): child world_pos = child local + parent local
   3. Convert world positions to CellCoord + offset via `Grid::translation_to_grid()` on the root grid (`With<BigSpace>`)
-- Hierarchical orbits: Moon has `parent: Some(earth_entity)`, Earth has `parent: None` (orbits origin)
+- Hierarchical orbits: satellite has `parent: Some(planet_id)`, planet has `parent: None` (orbits origin)
 
 ### Camera (`camera.rs`)
 
