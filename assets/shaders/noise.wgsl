@@ -90,14 +90,14 @@ fn simplex3d(v: vec3<f32>) -> f32 {
 
 /// Fractal Brownian Motion with distance-based octave culling.
 ///
-/// - `p`: sample position
+/// - `p`: sample position (in noise-space coordinates)
 /// - `max_octaves`: maximum number of octaves to evaluate
 /// - `lacunarity`: frequency multiplier per octave (typically 2.0)
 /// - `persistence`: amplitude multiplier per octave (typically 0.5)
-/// - `cam_dist`: distance from camera to sample point (world units)
-/// - `pixel_size`: approximate world-space size of a screen pixel at the sample
+/// - `min_feature_size`: minimum feature size to render (in the same coordinate
+///   space as `p`). Octaves with smaller features smoothly fade out.
+///   Pass 0.0 to evaluate all octaves.
 ///
-/// Skips octaves whose feature size (1/frequency) falls below the pixel threshold.
 /// Normalizes by the full amplitude sum for max_octaves so adding octaves adds
 /// detail without rescaling the overall height range.
 fn fbm(
@@ -105,8 +105,7 @@ fn fbm(
     max_octaves: u32,
     lacunarity: f32,
     persistence: f32,
-    cam_dist: f32,
-    pixel_size: f32,
+    min_feature_size: f32,
 ) -> f32 {
     // Pre-compute the full amplitude sum for normalization.
     // This ensures that the output range stays stable regardless of how many
@@ -124,15 +123,18 @@ fn fbm(
     var pos = p;
 
     for (var i = 0u; i < max_octaves; i++) {
-        // Feature size of this octave in world units.
         let feature_size = 1.0 / frequency;
 
-        // Skip octaves whose features are smaller than a pixel.
-        if feature_size < pixel_size {
+        if feature_size < min_feature_size * 0.5 {
+            // Well below pixel threshold — skip remaining octaves.
             break;
         }
 
-        value += amplitude * simplex3d(pos);
+        // Smooth fade: full contribution when feature_size >= 2*min_feature_size,
+        // fading to zero when feature_size <= 0.5*min_feature_size.
+        let blend = smoothstep(0.5 * min_feature_size, 2.0 * min_feature_size, feature_size);
+        value += amplitude * blend * simplex3d(pos);
+
         amplitude *= persistence;
         frequency *= lacunarity;
         pos = pos * lacunarity;

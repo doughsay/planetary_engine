@@ -25,6 +25,8 @@ pub struct PlanetSdfUniforms {
     pub noise_lacunarity: f32,
     pub noise_persistence: f32,
     pub noise_octaves: u32,
+    /// 0 = normal, 1 = octave count, 2 = ray steps, 3 = normals
+    pub debug_mode: u32,
 }
 
 // ---------------------------------------------------------------------------
