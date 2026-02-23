@@ -111,11 +111,29 @@ fn setup_scene(
         radius: PLANET_RADIUS,
         max_elevation: 50.0,
         noise_frequency: 4.0,
-        noise_amplitude: 50.0,
+        noise_amplitude: 10.0,  // Reduced from 50 — craters are the main feature
         noise_lacunarity: 2.0,
         noise_persistence: 0.5,
         noise_octaves: 14,
-        ..Default::default()
+        crater_enabled: true,
+        // Tier 0: large basins
+        crater_frequency_0: 6.0,
+        crater_depth_0: 15.0,
+        crater_rim_height_0: 5.0,
+        crater_peak_height_0: 3.0,
+        crater_density_0: 0.4,
+        // Tier 1: medium craters
+        crater_frequency_1: 20.0,
+        crater_depth_1: 5.0,
+        crater_rim_height_1: 2.0,
+        crater_peak_height_1: 0.5,
+        crater_density_1: 0.5,
+        // Tier 2: small pocks
+        crater_frequency_2: 60.0,
+        crater_depth_2: 1.5,
+        crater_rim_height_2: 0.5,
+        crater_peak_height_2: 0.0,
+        crater_density_2: 0.6,
     };
 
     let planet_material_handle = planet_materials.add(PlanetMaterial {

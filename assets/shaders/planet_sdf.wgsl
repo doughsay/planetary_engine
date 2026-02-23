@@ -156,15 +156,33 @@ const STEP_RELAXATION: f32 = 0.6;
 /// `min_feature_size` is in noise-space units (pre-converted by caller).
 fn planet_sdf(p: vec3<f32>, min_feature_size: f32) -> f32 {
     let dir = normalize(p - uniforms.planet_center);
-    let noise_val = fbm(
+
+    // Base terrain roughness
+    var elevation = fbm(
         dir * uniforms.noise_frequency,
         uniforms.noise_octaves,
         uniforms.noise_lacunarity,
         uniforms.noise_persistence,
         min_feature_size,
-    );
-    let terrain_radius = uniforms.planet_radius + noise_val * uniforms.noise_amplitude;
-    return length(p - uniforms.planet_center) - terrain_radius;
+    ) * uniforms.noise_amplitude;
+
+    // Crater displacement (3 tiers)
+    if (uniforms.crater_enabled != 0u) {
+        elevation += crater_field(dir,
+            uniforms.crater_frequency_0, uniforms.crater_depth_0,
+            uniforms.crater_rim_height_0, uniforms.crater_peak_height_0,
+            uniforms.crater_density_0);
+        elevation += crater_field(dir,
+            uniforms.crater_frequency_1, uniforms.crater_depth_1,
+            uniforms.crater_rim_height_1, uniforms.crater_peak_height_1,
+            uniforms.crater_density_1);
+        elevation += crater_field(dir,
+            uniforms.crater_frequency_2, uniforms.crater_depth_2,
+            uniforms.crater_rim_height_2, uniforms.crater_peak_height_2,
+            uniforms.crater_density_2);
+    }
+
+    return length(p - uniforms.planet_center) - (uniforms.planet_radius + elevation);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
