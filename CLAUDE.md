@@ -126,22 +126,31 @@ Terrain is rendered via GPU raymarching on an icosphere mesh per planet. No CPU-
 
 **Rust side (`planet_material.rs`):**
 - `PlanetMaterial` implements Bevy `Material` trait with `AsBindGroup` derive
-- `PlanetSdfUniforms` (ShaderType): planet_center, planet_radius, camera_position, max_elevation, sun_direction, noise params
+- `PlanetSdfUniforms` (ShaderType): planet_center, planet_radius, camera_position, max_elevation, sun_direction, noise params, crater params (3 tiers)
 - `SdfConfig` — Rust-side config struct holding noise parameters per planet
 - Pipeline specialization: `cull_mode = None`, `depth_write = true`, `AlphaMode::Opaque`
 - `enable_prepass() -> false`, `enable_shadows() -> false`
 
 **Shader side (`planet_sdf.wgsl`):**
 - Vertex shader: positions unit icosphere at `planet_center` scaled by `planet_radius + max_elevation` (same pattern as galaxy.wgsl — no `mesh_functions` import)
-- SDF: `sdf(p) = length(p - center) - radius - fbm(normalize(p - center) * frequency) * amplitude`
-- Sphere tracing: ray from camera through fragment, bounded by bounding sphere and core sphere, MAX_STEPS=128, SURFACE_EPSILON=0.01 (10m)
+- SDF: `sdf(p) = length(p - center) - (radius + elevation)` where elevation = FBM noise + crater displacement (if enabled)
+- Sphere tracing: ray from camera through fragment, bounded by bounding sphere and core sphere, MAX_STEPS=256, SURFACE_EPSILON=0.01 (10m)
 - Normal: SDF gradient via central finite differences (6 extra SDF evaluations), epsilon scaled by camera distance
 - Lighting: Lambertian (ambient 0.03 + diffuse 0.9) with `sun_direction`
 - Depth: writes `frag_depth` at actual hit point (not icosphere surface) for correct depth testing
 - LOD: FBM octave count scales automatically with distance — sub-pixel octaves are skipped
 
+**Crater system (`planet_sdf.wgsl`):**
+- Voronoi cell placement on the unit-sphere direction vector — avoids pole distortion from UV-based approaches
+- `crater_profile(r)`: parabolic bowl + Gaussian rim + optional central peak, smooth falloff beyond rim
+- `crater_field(dir, ...)`: 3x3x3 neighbor cell search, jittered crater centers, per-cell size variation
+- Three scale tiers evaluated independently and summed: large basins, medium craters, small pocks
+- `crater_enabled` uniform toggle — planets with craters disabled pay zero GPU cost
+- Per-tier params: `crater_frequency_N`, `crater_depth_N`, `crater_rim_height_N`, `crater_peak_height_N`, `crater_density_N`
+
 **Noise (`noise.wgsl`):**
 - 3D simplex noise (Ashima webgl-noise port), `#define_import_path noise`
+- `hash33(vec3) -> vec3`: pseudorandom hash for Voronoi cell jittering
 - FBM with distance-based octave culling: compares feature size (1/frequency) to pixel size, breaks when features are sub-pixel
 - Normalizes by full amplitude sum so adding octaves adds detail without rescaling
 
@@ -204,7 +213,7 @@ Terrain is rendered via GPU raymarching on an icosphere mesh per planet. No CPU-
 
 | Constant | Value | Location | Rationale |
 |---|---|---|---|
-| `MAX_STEPS` | 128 | planet_sdf.wgsl | Ray march step budget |
+| `MAX_STEPS` | 256 | planet_sdf.wgsl | Ray march step budget |
 | `SURFACE_EPSILON` | 0.01 | planet_sdf.wgsl | SDF hit threshold (~10m in km world units) |
 | `pixel_angular_size` | 0.0005 | planet_sdf.wgsl | ~60° FOV at ~2000px width |
 

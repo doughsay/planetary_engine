@@ -31,40 +31,38 @@ Each phase produces a working, runnable program. No phase should leave the proje
 
 ---
 
-## Phase 2: SDF Rendering Foundation
+## Phase 2: SDF Rendering Foundation ✅ COMPLETE
 
 **Goal**: Replace the mesh-based terrain pipeline with GPU raymarching. A single planet rendered via sphere tracing with basic noise terrain.
 
-**Tasks**:
-1. Create `assets/shaders/noise.wgsl` — 3D simplex noise (port of Ashima/webgl-noise)
-2. Create `assets/shaders/planet_sdf.wgsl` — sphere tracing + FBM displacement + Lambertian lighting + distance-based octave LOD
-3. Create `src/planet_material.rs` — Bevy `Material` impl with `PlanetSdfUniforms`, pipeline specialization (no cull, depth write, opaque, no frustum culling)
-4. Update `src/planet.rs` — replace `TerrainConfig` with `SdfConfig` (noise parameters as Rust struct)
-5. Update `src/main.rs` — spawn terrain icosphere mesh per planet with `PlanetMaterial`
-6. Remove `src/terrain.rs`, `src/quadtree.rs`, `src/chunk_mesh.rs`, `src/lod.rs`, `src/mesh_task.rs`
-
-**What changes**: New `planet_material.rs`, new WGSL shaders, adapted `planet.rs` + `main.rs`
-**What gets removed**: `terrain.rs`, `quadtree.rs`, `chunk_mesh.rs`, `lod.rs`, `mesh_task.rs`
-**Risk**: Medium — new shader pipeline, but pattern proven by existing atmosphere shader
-**Deliverable**: Bumpy spherical planet rendered via raymarching, more detail as you zoom in
+**What changed**: New `planet_material.rs`, new WGSL shaders (`noise.wgsl`, `planet_sdf.wgsl`), adapted `planet.rs` + `main.rs`. Removed `terrain.rs`, `quadtree.rs`, `chunk_mesh.rs`, `lod.rs`, `mesh_task.rs`.
+**Deliverable**: Bumpy spherical planet rendered via raymarching, more detail as you zoom in. SDF gradient normals, correct `frag_depth`, multi-planet rendering, dynamic sun direction all working.
 
 ---
 
-## Phase 3: Terrain Quality + Lighting
+## Phase 3: Terrain Quality — Crater System ✅ IN PROGRESS
 
-**Goal**: Terrain that looks like real geography, properly lit.
+**Goal**: Composable terrain layers that produce distinct planet types (moon-like, earth-like, mars-like) via uniform parameters in a single shader.
 
-**Tasks**:
-1. Add terrain building blocks to WGSL: ridge noise, domain warping
-2. Tune continental-scale noise for realistic landmass shapes
-3. SDF gradient normals (finite differences, epsilon scaled by distance)
-4. Dynamic sun direction from orbital position (`DirectionalLight` tracks sun entity)
-5. Correct `frag_depth` output for depth buffer integration
-6. Multi-planet rendering: Earth + Moon with different SDF configs
+**Completed tasks**:
+1. ✅ SDF gradient normals (finite differences, epsilon scaled by distance) — done in Phase 2
+2. ✅ Correct `frag_depth` output for depth buffer integration — done in Phase 2
+3. ✅ Multi-planet rendering with different SDF configs — done in Phase 2
+4. ✅ Dynamic sun direction from orbital position — shader uniforms update from orbit
+5. ✅ Voronoi cell crater system — `crater_profile()` (bowl + rim + central peak) + `crater_field()` (3D cell placement)
+6. ✅ Three-tier multi-scale craters (large basins, medium craters, small pocks) with per-tier uniforms
+7. ✅ `hash33()` pseudorandom function in noise library
+8. ✅ Reusable crater system — any planet can opt in via `SdfConfig` (`crater_enabled` toggle)
 
-**What changes**: `planet_sdf.wgsl` (new noise functions, lighting), `planet_material.rs` (uniform updates), `main.rs` (light tracking)
+**Remaining tasks**:
+1. Ridge noise (`1 - abs(noise)`) for sharp mountain ridges
+2. Domain warping for organic continental shapes
+3. `DirectionalLight` entity tracking sun position (currently static transform)
+4. Continental noise layering (separate frequency tiers)
+
+**What changed**: `planet_sdf.wgsl` (crater functions, layered SDF composition), `noise.wgsl` (hash33), `planet_material.rs` (crater uniforms in `PlanetSdfUniforms` + `SdfConfig`), `main.rs` (renamed Earth/Moon to planet/satellite, crater config on main planet)
 **Risk**: Low — iterative shader improvement
-**Deliverable**: Multiple planets with distinct, realistic terrain lit by the sun
+**Deliverable**: Moon-like planet with multi-scale craters, distinct from satellite's smooth FBM terrain
 
 ---
 
