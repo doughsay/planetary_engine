@@ -42,6 +42,20 @@ pub struct SdfConfig {
     pub noise_octaves: u32,
 }
 
+impl Default for SdfConfig {
+    fn default() -> Self {
+        Self {
+            radius: 1000.0,
+            max_elevation: 50.0,
+            noise_frequency: 4.0,
+            noise_amplitude: 50.0,
+            noise_lacunarity: 2.0,
+            noise_persistence: 0.5,
+            noise_octaves: 14,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Material
 // ---------------------------------------------------------------------------

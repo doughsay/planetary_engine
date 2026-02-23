@@ -1,13 +1,13 @@
 # Planetary Engine
 
-A procedural planet rendering engine with quadtree LOD, atmospheric scattering, starfield, and galaxy backdrop, built with Rust and Bevy.
+A procedural planet rendering engine with SDF raymarching, starfield, and galaxy backdrop, built with Rust and Bevy.
 
 ## Tech Stack
 
 - **Rust** (edition 2024)
 - **Bevy 0.18** - game engine / renderer
 - **big_space 0.12** - floating origin for large-scale worlds
-- **noise 0.9** - procedural terrain generation (Fbm + SuperSimplex)
+- **noise 0.9** - available for CPU-side noise (currently unused — terrain noise is in WGSL)
 
 ## IMPORTANT: Bevy 0.18 API Notes
 
@@ -95,22 +95,18 @@ Then add `BigSpaceDefaultPlugins` which provides big_space's own transform propa
 
 ```
 src/
-  main.rs        - App setup, plugins, lighting, camera spawn, scene setup
-  planet.rs      - Planet component + PlanetPlugin
-  orbit.rs       - Orbit component, OrbitalTime resource, Keplerian solver
-  atmosphere.rs  - Per-planet sphere-mesh atmosphere (Material trait)
-  camera.rs      - SpaceCamera: 6DOF flight controls (mouse, keyboard, scroll)
-  terrain.rs     - TerrainConfig: noise evaluation + normal computation
-  quadtree.rs    - CubeFace, NodeId, FaceQuadtree (pure data, no ECS)
-  chunk_mesh.rs  - Per-node mesh generation with seam handling
-  lod.rs         - PlanetQuadtree component, ChunkNode component, per-planet LOD systems
-  mesh_task.rs   - Async mesh generation using AsyncComputeTaskPool
-  starfield.rs   - Procedural starfield (~250k stars) with spectral colors
-  galaxy.rs      - Procedural Milky Way backdrop (dust lanes, spiral arms, bulge)
+  main.rs            - App setup, plugins, lighting, camera spawn, scene setup
+  planet.rs          - Planet component, PlanetPlugin, update_planet_materials system
+  planet_material.rs - PlanetMaterial (Bevy Material), PlanetSdfUniforms, SdfConfig
+  orbit.rs           - Orbit component, OrbitalTime resource, Keplerian solver
+  camera.rs          - SpaceCamera: 6DOF flight controls (mouse, keyboard, scroll)
+  starfield.rs       - Procedural starfield (~250k stars) with spectral colors
+  galaxy.rs          - Procedural Milky Way backdrop (dust lanes, spiral arms, bulge)
 assets/shaders/
-  atmosphere.wgsl - Rayleigh + Mie scattering ray march
-  starfield.wgsl  - Star rendering with Airy PSF diffraction
-  galaxy.wgsl     - Galactic rendering with multi-layer procedural noise
+  noise.wgsl       - 3D simplex noise + FBM with distance-based octave LOD
+  planet_sdf.wgsl  - Terrain SDF sphere tracing, lighting, depth output
+  starfield.wgsl   - Star rendering with Airy PSF diffraction
+  galaxy.wgsl      - Galactic rendering with multi-layer procedural noise
 ```
 
 ## Architecture
@@ -124,34 +120,44 @@ assets/shaders/
   - Earth orbit: 15,000 km (30s period), Moon orbit: 4,000 km around Earth (10s period)
 - Original single-planet scale: Radius 6360, atmosphere shell 100 km thick
 
-### Terrain (`terrain.rs`)
+### SDF Terrain Rendering (`planet_material.rs` + `planet_sdf.wgsl`)
 
-`TerrainConfig` is the single source of truth for elevation:
-- `get_displaced_position(normalized_dir)` — deterministic elevation for any point on the unit sphere
-- `compute_normal(dir, tangent, bitangent, pos)` — finite-difference normals
-- Same output regardless of which LOD level calls it
+Terrain is rendered via GPU raymarching on an icosphere mesh per planet. No CPU-side mesh generation, no octree, no seam stitching.
 
-### Quadtree (`quadtree.rs`)
+**Rust side (`planet_material.rs`):**
+- `PlanetMaterial` implements Bevy `Material` trait with `AsBindGroup` derive
+- `PlanetSdfUniforms` (ShaderType): planet_center, planet_radius, camera_position, max_elevation, sun_direction, noise params
+- `SdfConfig` — Rust-side config struct holding noise parameters per planet
+- Pipeline specialization: `cull_mode = None`, `depth_write = true`, `AlphaMode::Opaque`
+- `enable_prepass() -> false`, `enable_shadows() -> false`
 
-Pure data structure (no ECS dependencies):
-- `CubeFace` enum (6 faces) with `axes()` returning (normal, axis_a, axis_b)
-- `NodeId { face, depth, x, y }` — uniquely identifies any node
-  - `uv_bounds()`, `center_on_sphere()`, `arc_length()`
-  - `children()`, `parent()`, `neighbors()` with cross-face lookups
-- `FaceQuadtree` — HashMap-based tree tracking Leaf vs Split states
-- Cross-face adjacency table handles UV coordinate mapping across cube edges
+**Shader side (`planet_sdf.wgsl`):**
+- Vertex shader: positions unit icosphere at `planet_center` scaled by `planet_radius + max_elevation` (same pattern as galaxy.wgsl — no `mesh_functions` import)
+- SDF: `sdf(p) = length(p - center) - radius - fbm(normalize(p - center) * frequency) * amplitude`
+- Sphere tracing: ray from camera through fragment, bounded by bounding sphere and core sphere, MAX_STEPS=128, SURFACE_EPSILON=0.01 (10m)
+- Normal: SDF gradient via central finite differences (6 extra SDF evaluations), epsilon scaled by camera distance
+- Lighting: Lambertian (ambient 0.03 + diffuse 0.9) with `sun_direction`
+- Depth: writes `frag_depth` at actual hit point (not icosphere surface) for correct depth testing
+- LOD: FBM octave count scales automatically with distance — sub-pixel octaves are skipped
 
-### Chunk Meshes (`chunk_mesh.rs`)
+**Noise (`noise.wgsl`):**
+- 3D simplex noise (Ashima webgl-noise port), `#define_import_path noise`
+- FBM with distance-based octave culling: compares feature size (1/frequency) to pixel size, breaks when features are sub-pixel
+- Normalizes by full amplitude sum so adding octaves adds detail without rescaling
 
-- 33×33 vertices per chunk (32 quads per edge, ~2048 triangles)
-- Vertices placed by mapping node's UV sub-range through cube-face projection + terrain displacement
-- **Seam handling**: when a neighbor is 1 level coarser, odd-indexed edge vertices snap to interpolated positions
+**Entity setup (main.rs):**
+- `Sphere::new(1.0).mesh().ico(5)` — unit icosphere, shader handles world positioning
+- `Transform::default()` + `NoFrustumCulling` — mesh position is shader-driven, not transform-driven
+- Camera has `DepthPrepass` component for future atmosphere integration
+
+**`update_planet_materials` system (`planet.rs`):**
+- Runs each frame, updates every planet's material uniforms with current camera position, planet center (from GlobalTransform), and sun direction
 
 ### Multi-Planet System
 
-- `Planet` component on each planet entity, `PlanetQuadtree` component holds per-planet quadtree state + material
-- `ChunkNode.planet: Entity` links each chunk to its owning planet
-- Planets are spawned via `spawn_grid_default` (each gets own sub-Grid for chunk children)
+- `Planet` component on each planet entity holds `SdfConfig` + `material_handle: Handle<PlanetMaterial>`
+- Each planet spawns an icosphere child entity with `PlanetMaterial`
+- Planets are spawned via `spawn_grid_default` (each gets own sub-Grid for children)
 - `Sun` marker component on the star entity, `Moon` marker on the moon
 - Camera tracking hotkeys: hold 1/2/3 to smoothly look at Sun/Earth/Moon
 
@@ -165,35 +171,6 @@ Pure data structure (no ECS dependencies):
   3. Convert world positions to CellCoord + offset via `Grid::translation_to_grid()` on the root grid (`With<BigSpace>`)
 - Hierarchical orbits: Moon has `parent: Some(earth_entity)`, Earth has `parent: None` (orbits origin)
 
-### LOD System (`lod.rs`)
-
-**Per-planet LOD**: `update_lod` queries `With<Planet>`, each planet's `PlanetQuadtree` is evaluated independently against the camera position.
-
-**Screen-space error metric:**
-```
-geometric_error = node_arc_length * radius / CHUNK_RESOLUTION
-pixel_error = geometric_error / distance * PERSPECTIVE_SCALE
-Split if pixel_error > 1.0, Merge if < 0.5 (hysteresis)
-```
-
-**Constraints:**
-- Max 1 level difference between adjacent leaves (forced splits propagate)
-- Max 32 splits per frame to avoid hitches
-- Max depth: 15 (~10m resolution at radius 6360)
-
-**Systems (ordered):**
-1. `update_lod` — evaluate screen error per planet, decide splits/merges
-2. `sync_chunk_entities` — spawn/despawn entities to match desired leaf set (uses `Changed<PlanetQuadtree>`)
-3. `regenerate_dirty_chunks` — re-mesh chunks whose neighbor depths changed
-4. `poll_mesh_tasks` — collect completed async meshes
-5. `cleanup_retained_parents` — despawn old chunks once children are ready
-
-### Async Mesh Generation (`mesh_task.rs`)
-
-- Uses `AsyncComputeTaskPool` to generate meshes off the main thread
-- `PendingMesh(Task<Mesh>)` component on chunks awaiting their mesh
-- Parent chunks get `RetainUntilChildrenReady` — stay visible until all 4 children have meshes
-
 ### Camera (`camera.rs`)
 
 `SpaceCameraPlugin` provides true 6DOF flight controls:
@@ -202,33 +179,6 @@ Split if pixel_error > 1.0, Merge if < 0.5 (hysteresis)
 - **Q/E**: roll, **Shift**: boost (50x), **Scroll**: adjust base speed
 - Exponential friction smoothing, quaternion rotation (no gimbal lock)
 - `SpaceCamera` config component + `SpaceCameraState` runtime state
-
-### Atmosphere (`atmosphere.rs` + `atmosphere.wgsl`)
-
-Per-planet sphere-mesh atmosphere using Bevy's `Material` trait. Each planet gets its own atmosphere entity with an icosphere mesh, enabling multi-planet support without fullscreen shader interference.
-
-**Rust side (`atmosphere.rs`):**
-- `AtmosphereMaterial` implements `Material` trait with `AsBindGroup` derive
-- `AtmosphereUniforms` (ShaderType): planet_center, planet_radius, sun_direction, atmo_radius, settings
-- `AlphaMode::Premultiplied` — blend equation `src + dst * (1 - src.a)` gives `inscatter + scene * transmittance`
-- Pipeline specialization: `cull_mode = None` (renders both faces), `depth_write = false`, `depth_compare = Always`
-- `enable_prepass() -> false`, `enable_shadows() -> false` — atmosphere doesn't participate in depth/shadow passes
-
-**Shader side (`atmosphere.wgsl`):**
-- Vertex shader computes world position from uniforms: `v.position * atmo_radius + planet_center` (unit sphere mesh, no mesh_functions import needed)
-- `@builtin(front_facing)` selects correct face: front when camera outside atmosphere, back when inside — prevents double-draw
-- Ray-sphere intersection for atmosphere shell and planet surface
-- Depth prepass texture (`#ifdef DEPTH_PREPASS`) for terrain-aware ray clamping: reconstructs terrain world position via `view.world_from_clip`, limits ray march to actual terrain depth
-- Rayleigh + Mie scattering ray march (16 view steps, 4 light steps)
-- Earth-like constants in km: `BETA_R = (5.5e-3, 13.0e-3, 22.4e-3)/km`, `H_R = 8km`, `BETA_M = 21e-3/km`, `H_M = 1.2km`, `G_MIE = 0.76`
-- Henyey-Greenstein phase function for Mie, analytical Rayleigh phase
-- Sun shadow detection on light path (secondary ray-sphere against planet)
-- Premultiplied alpha output: `vec4(inscatter * SUN_INTENSITY, 1.0 - luminance(transmittance))`
-
-**Entity setup (main.rs):**
-- `Sphere::new(1.0).mesh().ico(5)` — unit icosphere, shader handles world positioning
-- `Transform::default()` + `NoFrustumCulling` — mesh position is shader-driven, not transform-driven
-- Camera requires `DepthPrepass` component for terrain-aware atmosphere
 
 **HDR pipeline:**
 - `Exposure::SUNLIGHT` + `Tonemapping::AcesFitted`
@@ -252,14 +202,11 @@ Per-planet sphere-mesh atmosphere using Bevy's `Material` trait. Each planet get
 
 ## Key Constants
 
-| Constant | Value | Rationale |
-|---|---|---|
-| `CHUNK_RESOLUTION` | 33 | 32 quads/edge, ~47 KB per chunk |
-| `MAX_DEPTH` | 15 | ~10m ground resolution |
-| `SPLIT_THRESHOLD` | 1.0 | Screen-space error trigger |
-| `MERGE_THRESHOLD` | 0.5 | Hysteresis prevents thrashing |
-| `MAX_SPLITS_PER_FRAME` | 16 | Prevents frame hitches |
-| `PERSPECTIVE_SCALE` | 500.0 | Converts world/distance ratio to pixel error |
+| Constant | Value | Location | Rationale |
+|---|---|---|---|
+| `MAX_STEPS` | 128 | planet_sdf.wgsl | Ray march step budget |
+| `SURFACE_EPSILON` | 0.01 | planet_sdf.wgsl | SDF hit threshold (~10m in km world units) |
+| `pixel_angular_size` | 0.0005 | planet_sdf.wgsl | ~60° FOV at ~2000px width |
 
 ## Build
 
