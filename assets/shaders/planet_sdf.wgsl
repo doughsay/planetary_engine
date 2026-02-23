@@ -1,5 +1,5 @@
 #import bevy_pbr::mesh_view_bindings::view
-#import noise::{simplex3d, fbm}
+#import noise::{simplex3d, fbm, hash33}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Uniforms — must match PlanetSdfUniforms in planet_material.rs exactly.
@@ -18,6 +18,23 @@ struct PlanetSdfUniforms {
     noise_octaves: u32,
     // 0 = normal, 1 = octave count, 2 = ray steps, 3 = normals
     debug_mode: u32,
+    // Crater system
+    crater_enabled: u32,
+    crater_frequency_0: f32,
+    crater_depth_0: f32,
+    crater_rim_height_0: f32,
+    crater_peak_height_0: f32,
+    crater_density_0: f32,
+    crater_frequency_1: f32,
+    crater_depth_1: f32,
+    crater_rim_height_1: f32,
+    crater_peak_height_1: f32,
+    crater_density_1: f32,
+    crater_frequency_2: f32,
+    crater_depth_2: f32,
+    crater_rim_height_2: f32,
+    crater_peak_height_2: f32,
+    crater_density_2: f32,
 }
 
 @group(#{MATERIAL_BIND_GROUP}) @binding(0)
@@ -51,6 +68,76 @@ fn vertex(v: Vertex) -> VertexOutput {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// Crater system — Voronoi cell placement with multi-scale tiers
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Crater cross-section profile as a function of normalized radial distance.
+/// r=0 is crater center, r=1 is rim edge.
+/// Returns displacement: negative (bowl), positive (rim/peak).
+fn crater_profile(r: f32, depth: f32, rim_height: f32, peak_height: f32) -> f32 {
+    // Bowl: parabolic depression, zero beyond r=1
+    let bowl = -depth * max(1.0 - r * r, 0.0);
+
+    // Rim: Gaussian bump centered at r=1
+    let rim = rim_height * exp(-8.0 * (r - 1.0) * (r - 1.0));
+
+    // Central peak: narrow Gaussian at center
+    let peak = peak_height * exp(-50.0 * r * r);
+
+    // Fade everything smoothly to zero beyond the rim
+    let fade = 1.0 - smoothstep(1.2, 2.0, r);
+
+    return (bowl + rim + peak) * fade;
+}
+
+/// Evaluate one tier of craters using Voronoi cell placement.
+/// `dir` is the normalized surface direction (unit sphere).
+/// Returns elevation displacement in world units (km).
+fn crater_field(
+    dir: vec3<f32>,
+    cell_freq: f32,
+    depth: f32,
+    rim_height: f32,
+    peak_height: f32,
+    density: f32,
+) -> f32 {
+    let p = dir * cell_freq;
+    let cell = floor(p);
+
+    var displacement = 0.0;
+
+    for (var dx: i32 = -1; dx <= 1; dx += 1) {
+        for (var dy: i32 = -1; dy <= 1; dy += 1) {
+            for (var dz: i32 = -1; dz <= 1; dz += 1) {
+                let neighbor = cell + vec3<f32>(f32(dx), f32(dy), f32(dz));
+                let h = hash33(neighbor);
+
+                // Does this cell contain a crater?
+                if (h.z > density) { continue; }
+
+                // Jittered crater center within the cell
+                let crater_pos = neighbor + h * 0.8 + 0.1;
+
+                // Distance from sample to crater center
+                let d = length(p - crater_pos);
+
+                // Crater radius varies per cell (0.3–0.5 of cell size)
+                let crater_radius = 0.3 + fract(h.x * 13.7 + h.y * 7.3) * 0.2;
+
+                // Normalized radial distance
+                let r = d / crater_radius;
+
+                if (r > 2.0) { continue; }
+
+                displacement += crater_profile(r, depth, rim_height, peak_height);
+            }
+        }
+    }
+
+    return displacement;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // SDF evaluation
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -69,15 +156,33 @@ const STEP_RELAXATION: f32 = 0.6;
 /// `min_feature_size` is in noise-space units (pre-converted by caller).
 fn planet_sdf(p: vec3<f32>, min_feature_size: f32) -> f32 {
     let dir = normalize(p - uniforms.planet_center);
-    let noise_val = fbm(
+
+    // Base terrain roughness
+    var elevation = fbm(
         dir * uniforms.noise_frequency,
         uniforms.noise_octaves,
         uniforms.noise_lacunarity,
         uniforms.noise_persistence,
         min_feature_size,
-    );
-    let terrain_radius = uniforms.planet_radius + noise_val * uniforms.noise_amplitude;
-    return length(p - uniforms.planet_center) - terrain_radius;
+    ) * uniforms.noise_amplitude;
+
+    // Crater displacement (3 tiers)
+    if (uniforms.crater_enabled != 0u) {
+        elevation += crater_field(dir,
+            uniforms.crater_frequency_0, uniforms.crater_depth_0,
+            uniforms.crater_rim_height_0, uniforms.crater_peak_height_0,
+            uniforms.crater_density_0);
+        elevation += crater_field(dir,
+            uniforms.crater_frequency_1, uniforms.crater_depth_1,
+            uniforms.crater_rim_height_1, uniforms.crater_peak_height_1,
+            uniforms.crater_density_1);
+        elevation += crater_field(dir,
+            uniforms.crater_frequency_2, uniforms.crater_depth_2,
+            uniforms.crater_rim_height_2, uniforms.crater_peak_height_2,
+            uniforms.crater_density_2);
+    }
+
+    return length(p - uniforms.planet_center) - (uniforms.planet_radius + elevation);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

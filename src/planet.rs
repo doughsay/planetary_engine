@@ -95,6 +95,22 @@ fn update_planet_materials(
             noise_persistence: planet.sdf.noise_persistence,
             noise_octaves: planet.sdf.noise_octaves,
             debug_mode: debug_mode.0,
+            crater_enabled: u32::from(planet.sdf.crater_enabled),
+            crater_frequency_0: planet.sdf.crater_frequency_0,
+            crater_depth_0: planet.sdf.crater_depth_0,
+            crater_rim_height_0: planet.sdf.crater_rim_height_0,
+            crater_peak_height_0: planet.sdf.crater_peak_height_0,
+            crater_density_0: planet.sdf.crater_density_0,
+            crater_frequency_1: planet.sdf.crater_frequency_1,
+            crater_depth_1: planet.sdf.crater_depth_1,
+            crater_rim_height_1: planet.sdf.crater_rim_height_1,
+            crater_peak_height_1: planet.sdf.crater_peak_height_1,
+            crater_density_1: planet.sdf.crater_density_1,
+            crater_frequency_2: planet.sdf.crater_frequency_2,
+            crater_depth_2: planet.sdf.crater_depth_2,
+            crater_rim_height_2: planet.sdf.crater_rim_height_2,
+            crater_peak_height_2: planet.sdf.crater_peak_height_2,
+            crater_density_2: planet.sdf.crater_density_2,
         };
     }
 }

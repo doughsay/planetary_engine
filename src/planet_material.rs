@@ -27,6 +27,23 @@ pub struct PlanetSdfUniforms {
     pub noise_octaves: u32,
     /// 0 = normal, 1 = octave count, 2 = ray steps, 3 = normals
     pub debug_mode: u32,
+    // ── Crater system ──
+    pub crater_enabled: u32,
+    pub crater_frequency_0: f32,
+    pub crater_depth_0: f32,
+    pub crater_rim_height_0: f32,
+    pub crater_peak_height_0: f32,
+    pub crater_density_0: f32,
+    pub crater_frequency_1: f32,
+    pub crater_depth_1: f32,
+    pub crater_rim_height_1: f32,
+    pub crater_peak_height_1: f32,
+    pub crater_density_1: f32,
+    pub crater_frequency_2: f32,
+    pub crater_depth_2: f32,
+    pub crater_rim_height_2: f32,
+    pub crater_peak_height_2: f32,
+    pub crater_density_2: f32,
 }
 
 // ---------------------------------------------------------------------------
@@ -42,6 +59,26 @@ pub struct SdfConfig {
     pub noise_lacunarity: f32,
     pub noise_persistence: f32,
     pub noise_octaves: u32,
+    // ── Crater system ──
+    pub crater_enabled: bool,
+    // Tier 0: large basins
+    pub crater_frequency_0: f32,
+    pub crater_depth_0: f32,
+    pub crater_rim_height_0: f32,
+    pub crater_peak_height_0: f32,
+    pub crater_density_0: f32,
+    // Tier 1: medium craters
+    pub crater_frequency_1: f32,
+    pub crater_depth_1: f32,
+    pub crater_rim_height_1: f32,
+    pub crater_peak_height_1: f32,
+    pub crater_density_1: f32,
+    // Tier 2: small pocks
+    pub crater_frequency_2: f32,
+    pub crater_depth_2: f32,
+    pub crater_rim_height_2: f32,
+    pub crater_peak_height_2: f32,
+    pub crater_density_2: f32,
 }
 
 impl Default for SdfConfig {
@@ -54,6 +91,22 @@ impl Default for SdfConfig {
             noise_lacunarity: 2.0,
             noise_persistence: 0.5,
             noise_octaves: 14,
+            crater_enabled: false,
+            crater_frequency_0: 0.0,
+            crater_depth_0: 0.0,
+            crater_rim_height_0: 0.0,
+            crater_peak_height_0: 0.0,
+            crater_density_0: 0.0,
+            crater_frequency_1: 0.0,
+            crater_depth_1: 0.0,
+            crater_rim_height_1: 0.0,
+            crater_peak_height_1: 0.0,
+            crater_density_1: 0.0,
+            crater_frequency_2: 0.0,
+            crater_depth_2: 0.0,
+            crater_rim_height_2: 0.0,
+            crater_peak_height_2: 0.0,
+            crater_density_2: 0.0,
         }
     }
 }

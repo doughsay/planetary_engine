@@ -88,6 +88,17 @@ fn simplex3d(v: vec3<f32>) -> f32 {
     return 105.0 * dot(m * m, vec4(dot(p0, x0), dot(p1, x1), dot(p2, x2), dot(p3, x3)));
 }
 
+/// Hash a vec3 cell coordinate to 3 pseudorandom values in [0, 1].
+/// Used for Voronoi cell jittering (crater placement, etc.).
+fn hash33(p: vec3<f32>) -> vec3<f32> {
+    var q = vec3<f32>(
+        dot(p, vec3<f32>(127.1, 311.7, 74.7)),
+        dot(p, vec3<f32>(269.5, 183.3, 246.1)),
+        dot(p, vec3<f32>(113.5, 271.9, 124.6)),
+    );
+    return fract(sin(q) * 43758.5453123);
+}
+
 /// Fractal Brownian Motion with distance-based octave culling.
 ///
 /// - `p`: sample position (in noise-space coordinates)
