@@ -1,5 +1,5 @@
 #import bevy_pbr::mesh_view_bindings::view
-#import noise::{simplex3d, fbm}
+#import noise::{simplex3d, fbm, hash33}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Uniforms — must match PlanetSdfUniforms in planet_material.rs exactly.
@@ -65,6 +65,76 @@ fn vertex(v: Vertex) -> VertexOutput {
     out.clip_position = view.clip_from_world * vec4(world_pos, 1.0);
     out.world_position = world_pos;
     return out;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Crater system — Voronoi cell placement with multi-scale tiers
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Crater cross-section profile as a function of normalized radial distance.
+/// r=0 is crater center, r=1 is rim edge.
+/// Returns displacement: negative (bowl), positive (rim/peak).
+fn crater_profile(r: f32, depth: f32, rim_height: f32, peak_height: f32) -> f32 {
+    // Bowl: parabolic depression, zero beyond r=1
+    let bowl = -depth * max(1.0 - r * r, 0.0);
+
+    // Rim: Gaussian bump centered at r=1
+    let rim = rim_height * exp(-8.0 * (r - 1.0) * (r - 1.0));
+
+    // Central peak: narrow Gaussian at center
+    let peak = peak_height * exp(-50.0 * r * r);
+
+    // Fade everything smoothly to zero beyond the rim
+    let fade = 1.0 - smoothstep(1.2, 2.0, r);
+
+    return (bowl + rim + peak) * fade;
+}
+
+/// Evaluate one tier of craters using Voronoi cell placement.
+/// `dir` is the normalized surface direction (unit sphere).
+/// Returns elevation displacement in world units (km).
+fn crater_field(
+    dir: vec3<f32>,
+    cell_freq: f32,
+    depth: f32,
+    rim_height: f32,
+    peak_height: f32,
+    density: f32,
+) -> f32 {
+    let p = dir * cell_freq;
+    let cell = floor(p);
+
+    var displacement = 0.0;
+
+    for (var dx: i32 = -1; dx <= 1; dx += 1) {
+        for (var dy: i32 = -1; dy <= 1; dy += 1) {
+            for (var dz: i32 = -1; dz <= 1; dz += 1) {
+                let neighbor = cell + vec3<f32>(f32(dx), f32(dy), f32(dz));
+                let h = hash33(neighbor);
+
+                // Does this cell contain a crater?
+                if (h.z > density) { continue; }
+
+                // Jittered crater center within the cell
+                let crater_pos = neighbor + h * 0.8 + 0.1;
+
+                // Distance from sample to crater center
+                let d = length(p - crater_pos);
+
+                // Crater radius varies per cell (0.3–0.5 of cell size)
+                let crater_radius = 0.3 + fract(h.x * 13.7 + h.y * 7.3) * 0.2;
+
+                // Normalized radial distance
+                let r = d / crater_radius;
+
+                if (r > 2.0) { continue; }
+
+                displacement += crater_profile(r, depth, rim_height, peak_height);
+            }
+        }
+    }
+
+    return displacement;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
