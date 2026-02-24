@@ -35,8 +35,15 @@ const SATELLITE_PERIOD: f64 = 10.0; // 10 second month
 
 const SUN_POSITION: Vec3 = Vec3::ZERO;
 
+#[derive(Resource)]
+struct BenchConfig;
+
 fn main() {
-    App::new()
+    let args: Vec<String> = std::env::args().collect();
+    let bench_mode = args.iter().any(|arg| arg == "--bench");
+
+    let mut app = App::new();
+    app.insert_resource(BenchConfig)
         .add_plugins(
             DefaultPlugins
                 .set(WindowPlugin {
@@ -51,15 +58,160 @@ fn main() {
                 .disable::<TransformPlugin>(),
         )
         .add_plugins(WireframePlugin::default())
+        .add_plugins(bevy::diagnostic::FrameTimeDiagnosticsPlugin::default())
         .add_plugins(BigSpaceDefaultPlugins)
-        .add_plugins(SpaceCameraPlugin)
         .add_plugins(PlanetPlugin)
         .add_plugins(OrbitPlugin)
         .add_plugins(starfield::StarfieldPlugin)
         .add_plugins(galaxy::GalaxyPlugin)
-        .add_systems(Startup, setup_scene)
-        .add_systems(Update, (toggle_wireframe, camera_tracking_hotkeys))
-        .run();
+        .add_systems(Startup, (setup_scene, setup_fps_counter))
+        .add_systems(Update, (toggle_wireframe, update_fps_counter));
+
+    if bench_mode {
+        app.add_plugins(BenchmarkPlugin);
+    } else {
+        app.add_plugins(SpaceCameraPlugin)
+           .add_systems(Update, camera_tracking_hotkeys);
+    }
+
+    app.run();
+}
+
+struct BenchmarkPlugin;
+
+#[derive(Resource)]
+struct BenchmarkState {
+    timer: f32,
+    log_timer: f32,
+}
+
+impl Plugin for BenchmarkPlugin {
+    fn build(&self, app: &mut App) {
+        app.insert_resource(BenchmarkState { timer: 0.0, log_timer: 0.0 })
+           .add_systems(Update, (run_benchmark_flyby, log_benchmark_stats).chain());
+    }
+}
+
+fn run_benchmark_flyby(
+    time: Res<Time>,
+    mut bench_state: ResMut<BenchmarkState>,
+    mut camera_q: Query<(&mut Transform, &mut SpaceCameraState, &mut CellCoord), With<Camera3d>>,
+) {
+    bench_state.timer += time.delta_secs();
+    let t = bench_state.timer;
+
+    // Exit after 10s
+    if t >= 10.0 {
+        info!("[BENCH] Benchmark complete. Exiting.");
+        std::process::exit(0);
+    }
+
+    let Ok((mut cam_transform, mut cam_state, mut cam_cell)) = camera_q.single_mut() else { return };
+    
+    // Reset velocity and cell coord to prevent accumulation/interference from big_space recentering
+    cam_state.velocity = Vec3::ZERO;
+    *cam_cell = CellCoord::default();
+
+    // Camera is a child of the planet, so (0,0,0) is the planet center in local space.
+    let planet_center = Vec3::ZERO;
+    let skim_alt = 40.0; // Much closer to the surface (PLANET_RADIUS is 1000)
+    let skim_radius = PLANET_RADIUS + skim_alt;
+
+    let target_pos: Vec3;
+    let look_at_target: Vec3;
+    let up: Vec3;
+
+    if t < 5.0 {
+        // Phase 1: Approach (0s - 5s)
+        let alpha = t / 5.0;
+        let eased_alpha = 1.0 - (1.0 - alpha).powi(3);
+        
+        let start_pos = Vec3::new(0.0, 0.0, PLANET_RADIUS + 8000.0);
+        let end_pos = Vec3::new(0.0, skim_alt, skim_radius);
+        let line_pos = start_pos.lerp(end_pos, eased_alpha);
+        
+        // Pre-calculate the orbital path we'll be blending into
+        let orbit_angle = (t - 5.0) * (std::f32::consts::PI / 15.0);
+        let orbit_pos = Vec3::new(
+            -skim_radius * orbit_angle.sin(), // Negated X for left turn
+            skim_alt,
+            skim_radius * orbit_angle.cos()
+        );
+        
+        // Smoothly blend from the straight line approach into the circular orbit
+        // between t=2.0 and t=5.0 to create a natural curve.
+        let blend = ((t - 2.0) / 3.0).clamp(0.0, 1.0);
+        let smooth_blend = blend * blend * (3.0 - 2.0 * blend);
+        target_pos = line_pos.lerp(orbit_pos, smooth_blend);
+        
+        // --- Unified Look-At ---
+        let surface_up = target_pos.normalize();
+        let tangent = Vec3::new(
+            -orbit_angle.cos(), // Negated X for left turn
+            0.0,
+            -orbit_angle.sin()
+        ).normalize();
+        let horizon_dir = (tangent * 2.0 - surface_up * 0.3).normalize();
+        let horizon_target = target_pos + horizon_dir * 1000.0;
+        
+        // Transition look from planet center to horizon in the final seconds of approach
+        let look_alpha = ((t - 3.5) / 1.5).clamp(0.0, 1.0);
+        let smooth_look = look_alpha * look_alpha * (3.0 - 2.0 * look_alpha);
+        look_at_target = planet_center.lerp(horizon_target, smooth_look);
+        up = Vec3::Y.lerp(surface_up, smooth_look);
+    } else {
+        // Phase 2: Skim horizon (5s - 10s)
+        let alpha = (t - 5.0) / 15.0; // Keep the same angular speed
+        let angle = alpha * std::f32::consts::PI;
+        
+        target_pos = Vec3::new(
+            -skim_radius * angle.sin(), // Negated X for left turn
+            skim_alt,
+            skim_radius * angle.cos()
+        );
+        
+        let surface_up = target_pos.normalize();
+        up = surface_up;
+        
+        let tangent = Vec3::new(
+            -angle.cos(), // Negated X for left turn
+            0.0,
+            -angle.sin()
+        ).normalize();
+        
+        let horizon_dir = (tangent * 2.0 - surface_up * 0.3).normalize();
+        let horizon_target = target_pos + horizon_dir * 1000.0;
+        
+        look_at_target = horizon_target; 
+    }
+
+    cam_transform.translation = target_pos;
+    cam_transform.look_at(look_at_target, up);
+}
+
+fn log_benchmark_stats(
+    time: Res<Time>,
+    mut bench_state: ResMut<BenchmarkState>,
+    diagnostics: Res<bevy::diagnostic::DiagnosticsStore>,
+) {
+    bench_state.log_timer += time.delta_secs();
+    if bench_state.log_timer >= 1.0 {
+        bench_state.log_timer -= 1.0;
+        
+        let fps = diagnostics
+            .get(&bevy::diagnostic::FrameTimeDiagnosticsPlugin::FPS)
+            .and_then(|d| d.smoothed())
+            .unwrap_or(0.0);
+        let frame_time = diagnostics
+            .get(&bevy::diagnostic::FrameTimeDiagnosticsPlugin::FRAME_TIME)
+            .and_then(|d| d.smoothed())
+            .unwrap_or(0.0);
+            
+        info!(
+            "[BENCH] Time: {:.1}s | FPS: {:.1} | Frame: {:.2}ms", 
+            bench_state.timer, fps, frame_time
+        );
+    }
 }
 
 fn setup_scene(
@@ -121,19 +273,14 @@ fn setup_scene(
         crater_depth_0: 15.0,
         crater_rim_height_0: 5.0,
         crater_peak_height_0: 3.0,
-        crater_density_0: 0.4,
+        crater_density_0: 0.3,
         // Tier 1: medium craters
         crater_frequency_1: 20.0,
         crater_depth_1: 5.0,
         crater_rim_height_1: 2.0,
         crater_peak_height_1: 0.5,
         crater_density_1: 0.5,
-        // Tier 2: small pocks
-        crater_frequency_2: 60.0,
-        crater_depth_2: 1.5,
-        crater_rim_height_2: 0.5,
-        crater_peak_height_2: 0.0,
-        crater_density_2: 0.6,
+        ..Default::default()
     };
 
     let planet_material_handle = planet_materials.add(PlanetMaterial {
@@ -282,7 +429,7 @@ fn camera_tracking_hotkeys(
         // Stop camera movement to prevent fighting with the camera input system
         cam_state.velocity = Vec3::ZERO;
 
-        let cam_world_pos = cam_global.translation();
+        let cam_world_pos: Vec3 = cam_global.translation();
         let to_target = target_pos - cam_world_pos;
         if to_target.length_squared() < 1.0 { return; }
         let dir = to_target.normalize();
@@ -304,4 +451,38 @@ fn toggle_wireframe(input: Res<ButtonInput<KeyCode>>, mut config: ResMut<Wirefra
     if input.just_pressed(KeyCode::F1) {
         config.global = !config.global;
     }
+}
+
+#[derive(Component)]
+struct FpsText;
+
+fn setup_fps_counter(mut commands: Commands) {
+    commands.spawn((
+        FpsText,
+        Text::new("-- fps\n-- ms"),
+        TextFont::from_font_size(18.0),
+        TextColor(Color::WHITE),
+        Node {
+            position_type: PositionType::Absolute,
+            left: Val::Px(10.0),
+            top: Val::Px(10.0),
+            ..default()
+        },
+    ));
+}
+
+fn update_fps_counter(
+    diagnostics: Res<bevy::diagnostic::DiagnosticsStore>,
+    mut query: Query<&mut Text, With<FpsText>>,
+) {
+    let Ok(mut text) = query.single_mut() else { return };
+    let fps = diagnostics
+        .get(&bevy::diagnostic::FrameTimeDiagnosticsPlugin::FPS)
+        .and_then(|d| d.smoothed())
+        .unwrap_or(0.0);
+    let frame_time = diagnostics
+        .get(&bevy::diagnostic::FrameTimeDiagnosticsPlugin::FRAME_TIME)
+        .and_then(|d| d.smoothed())
+        .unwrap_or(0.0);
+    text.0 = format!("{fps:.1} fps\n{frame_time:.1} ms");
 }

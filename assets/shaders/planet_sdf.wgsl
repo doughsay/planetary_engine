@@ -100,7 +100,13 @@ fn crater_field(
     rim_height: f32,
     peak_height: f32,
     density: f32,
+    min_feature_size: f32, // Distance-based culling
 ) -> f32 {
+    let cell_size = 1.0 / cell_freq;
+    if (cell_size < min_feature_size * 0.2) {
+        return 0.0;
+    }
+
     let p = dir * cell_freq;
     let cell = floor(p);
 
@@ -112,19 +118,11 @@ fn crater_field(
                 let neighbor = cell + vec3<f32>(f32(dx), f32(dy), f32(dz));
                 let h = hash33(neighbor);
 
-                // Does this cell contain a crater?
                 if (h.z > density) { continue; }
 
-                // Jittered crater center within the cell
                 let crater_pos = neighbor + h * 0.8 + 0.1;
-
-                // Distance from sample to crater center
                 let d = length(p - crater_pos);
-
-                // Crater radius varies per cell (0.3–0.5 of cell size)
                 let crater_radius = 0.3 + fract(h.x * 13.7 + h.y * 7.3) * 0.2;
-
-                // Normalized radial distance
                 let r = d / crater_radius;
 
                 if (r > 2.0) { continue; }
@@ -134,30 +132,22 @@ fn crater_field(
         }
     }
 
-    return displacement;
+    // Blend out as we reach the pixel size limit
+    return displacement * smoothstep(min_feature_size * 0.2, min_feature_size * 0.5, cell_size);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
 // SDF evaluation
 // ═══════════════════════════════════════════════════════════════════════════
 
-const MAX_STEPS: u32 = 256u;
-const SURFACE_EPSILON: f32 = 0.01; // 10m in km world units
+const MAX_STEPS: u32 = 256u; 
+const SURFACE_EPSILON: f32 = 0.005; // 5m in km units
 
-// Our SDF (radial distance to displaced sphere) overestimates the true
-// Euclidean distance for non-radial rays. The overestimation is bounded by
-// the terrain gradient magnitude: ~sqrt(1 + slope²). For our noise params
-// (amp=50, freq=4, radius=1000), max slope ≈ 1.4, gradient ≈ 1.72.
-// We step at 1/gradient of the SDF value to prevent overshooting.
-const STEP_RELAXATION: f32 = 0.6;
-
-/// Evaluate the planet SDF at point p.
-/// Returns signed distance: negative inside the terrain, positive outside.
-/// `min_feature_size` is in noise-space units (pre-converted by caller).
+/// Evaluate the planet SDF with full detail.
 fn planet_sdf(p: vec3<f32>, min_feature_size: f32) -> f32 {
-    let dir = normalize(p - uniforms.planet_center);
+    let dist_to_center = length(p - uniforms.planet_center);
+    let dir = (p - uniforms.planet_center) / dist_to_center;
 
-    // Base terrain roughness
     var elevation = fbm(
         dir * uniforms.noise_frequency,
         uniforms.noise_octaves,
@@ -166,23 +156,42 @@ fn planet_sdf(p: vec3<f32>, min_feature_size: f32) -> f32 {
         min_feature_size,
     ) * uniforms.noise_amplitude;
 
-    // Crater displacement (3 tiers)
     if (uniforms.crater_enabled != 0u) {
         elevation += crater_field(dir,
             uniforms.crater_frequency_0, uniforms.crater_depth_0,
             uniforms.crater_rim_height_0, uniforms.crater_peak_height_0,
-            uniforms.crater_density_0);
+            uniforms.crater_density_0, min_feature_size);
+        
         elevation += crater_field(dir,
             uniforms.crater_frequency_1, uniforms.crater_depth_1,
             uniforms.crater_rim_height_1, uniforms.crater_peak_height_1,
-            uniforms.crater_density_1);
+            uniforms.crater_density_1, min_feature_size);
+            
         elevation += crater_field(dir,
             uniforms.crater_frequency_2, uniforms.crater_depth_2,
             uniforms.crater_rim_height_2, uniforms.crater_peak_height_2,
-            uniforms.crater_density_2);
+            uniforms.crater_density_2, min_feature_size);
     }
 
-    return length(p - uniforms.planet_center) - (uniforms.planet_radius + elevation);
+    return dist_to_center - (uniforms.planet_radius + elevation);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Normal computation
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn compute_normal(p: vec3<f32>, cam_dist: f32, min_feature_size: f32) -> vec3<f32> {
+    // Scale epsilon with distance for stability.
+    let eps = max(cam_dist * 0.0001, SURFACE_EPSILON * 0.5);
+    
+    let d = planet_sdf(p, min_feature_size);
+    let n = vec3(
+        planet_sdf(p + vec3(eps, 0.0, 0.0), min_feature_size) - d,
+        planet_sdf(p + vec3(0.0, eps, 0.0), min_feature_size) - d,
+        planet_sdf(p + vec3(0.0, 0.0, eps), min_feature_size) - d,
+    );
+
+    return normalize(n);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -197,32 +206,12 @@ fn ray_sphere(origin: vec3<f32>, dir: vec3<f32>, center: vec3<f32>, radius: f32)
     let c = dot(oc, oc) - radius * radius;
     let discriminant = b * b - c;
 
-    if discriminant < 0.0 {
-        return vec2(1.0, -1.0); // No intersection sentinel
+    if (discriminant < 0.0) {
+        return vec2(1.0, -1.0);
     }
 
     let sqrt_d = sqrt(discriminant);
     return vec2(-b - sqrt_d, -b + sqrt_d);
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// Normal computation via central finite differences
-// ═══════════════════════════════════════════════════════════════════════════
-
-fn compute_normal(p: vec3<f32>, cam_dist: f32, min_feature_size: f32) -> vec3<f32> {
-    // Scale epsilon with distance for stable normals at all ranges.
-    let eps = max(cam_dist * 0.0001, SURFACE_EPSILON * 0.5);
-    let dx = vec3(eps, 0.0, 0.0);
-    let dy = vec3(0.0, eps, 0.0);
-    let dz = vec3(0.0, 0.0, eps);
-
-    let n = vec3(
-        planet_sdf(p + dx, min_feature_size) - planet_sdf(p - dx, min_feature_size),
-        planet_sdf(p + dy, min_feature_size) - planet_sdf(p - dy, min_feature_size),
-        planet_sdf(p + dz, min_feature_size) - planet_sdf(p - dz, min_feature_size),
-    );
-
-    return normalize(n);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -263,120 +252,93 @@ fn heatmap(t: f32) -> vec3<f32> {
     return vec3(r, g, b);
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// Fragment shader
-// ═══════════════════════════════════════════════════════════════════════════
-
 @fragment
 fn fragment(in: VertexOutput, @builtin(front_facing) front_facing: bool) -> FragmentOutput {
     let ray_origin = uniforms.camera_position;
     let ray_dir = normalize(in.world_position - ray_origin);
 
-    // Intersect ray with bounding sphere (radius + max_elevation)
     let bounding_radius = uniforms.planet_radius + uniforms.max_elevation;
     let bounds = ray_sphere(ray_origin, ray_dir, uniforms.planet_center, bounding_radius);
 
-    // No intersection with bounding sphere — discard
-    if bounds.x > bounds.y {
-        discard;
-    }
+    if (bounds.x > bounds.y) { discard; }
 
-    // Also intersect with a core sphere (radius - max_elevation) to get an
-    // early termination bound. If inside this sphere, we've definitely passed
-    // through all terrain.
-    let core_radius = max(uniforms.planet_radius - uniforms.max_elevation, 0.1);
-    let core_bounds = ray_sphere(ray_origin, ray_dir, uniforms.planet_center, core_radius);
-
-    // Determine march start: if camera is outside bounding sphere, start at
-    // the near intersection. If inside, start from the camera (t=0).
-    var t_start = max(bounds.x, 0.0);
-
-    // End: the far side of the bounding sphere, or the near side of the core
-    // sphere (whichever comes first, if core intersection is valid).
+    var t = max(bounds.x, 0.0);
     var t_end = bounds.y;
-    if core_bounds.x < core_bounds.y && core_bounds.x > t_start {
-        t_end = min(t_end, core_bounds.x);
-    }
 
-    // Approximate pixel angular size for octave culling.
-    // Assumes ~2000px screen width, 60-degree FOV → pixel_angular_size ≈ 0.0005 rad.
     let pixel_angular_size = 0.0005;
-
-    // Sphere tracing
-    var t = t_start;
     var hit = false;
     var steps_taken = 0u;
 
     for (var i = 0u; i < MAX_STEPS; i++) {
-        if (t > t_end) {
-            break;
-        }
+        if (t > t_end) { break; }
 
         let p = ray_origin + ray_dir * t;
-        let cam_dist = length(p - ray_origin);
-        
-        // Adaptive epsilon: we don't need 10m precision if a pixel is 1km wide.
-        // This significantly improves performance for skimming rays at distance.
-        let world_pixel_size = cam_dist * pixel_angular_size;
-        let epsilon = max(SURFACE_EPSILON, world_pixel_size * 0.5);
+        let dist_to_center = length(p - uniforms.planet_center);
+        let d_sphere = dist_to_center - uniforms.planet_radius;
 
-        // Convert pixel size from world-space to noise-space for octave culling.
-        let min_feature_size = world_pixel_size * uniforms.noise_frequency / uniforms.planet_radius;
-        let d = planet_sdf(p, min_feature_size);
+        // Adaptive quality traversal:
+        // Use a strictly conservative bound when far from the possible surface.
+        let safe_bound = d_sphere - uniforms.max_elevation;
+        
+        var d: f32;
+        var in_detail_zone = false;
+
+        if (safe_bound > 2.0) {
+            d = safe_bound;
+        } else {
+            in_detail_zone = true;
+            let world_pixel_size = t * pixel_angular_size;
+            let min_feature_size = world_pixel_size * uniforms.noise_frequency / uniforms.planet_radius;
+            d = planet_sdf(p, min_feature_size);
+        }
 
         steps_taken = i + 1u;
 
-        if (d < epsilon) {
-            hit = true;
-            break;
+        if (in_detail_zone) {
+            let world_pixel_size = t * pixel_angular_size;
+            let epsilon = clamp(world_pixel_size * 0.5, SURFACE_EPSILON, 0.05);
+            
+            if (d < epsilon) {
+                hit = true;
+                break;
+            }
+            
+            // Be more conservative at grazing angles to fix holes.
+            // We can detect grazing by checking how 'd' changes, but a simple 
+            // relaxation factor that scales with distance to center is easier.
+            let relaxation = mix(0.4, 0.8, smoothstep(0.0, 5.0, d));
+            t += max(d * relaxation, epsilon * 0.5);
+        } else {
+            // Far jump: no relaxation needed for the conservative bound.
+            t += d; 
         }
-
-        // Step by the SDF distance, but clamp minimum step to avoid
-        // getting stuck on shallow-angle approaches.
-        t += max(d * STEP_RELAXATION, epsilon * 0.5);
     }
 
-    if !hit {
-        discard;
-    }
+    if (!hit) { discard; }
 
-    // Hit point
     let hit_pos = ray_origin + ray_dir * t;
-    let cam_dist_hit = length(hit_pos - ray_origin);
-    let min_feature_hit = cam_dist_hit * pixel_angular_size * uniforms.noise_frequency / uniforms.planet_radius;
+    let cam_dist_hit = t;
+    let world_pixel_hit = cam_dist_hit * pixel_angular_size;
+    let min_feature_hit = world_pixel_hit * uniforms.noise_frequency / uniforms.planet_radius;
 
-    // Normal from SDF gradient
     let normal = compute_normal(hit_pos, cam_dist_hit, min_feature_hit);
-
-    // Compute depth: project hit point to clip space, extract depth.
     let clip_pos = view.clip_from_world * vec4(hit_pos, 1.0);
     let ndc_depth = clip_pos.z / clip_pos.w;
 
-    // ── Debug modes ────────────────────────────────────────────────────
     var final_color: vec3<f32>;
 
-    if uniforms.debug_mode == 1u {
-        // Octave count: blue (0) → red (max_octaves)
-        let octaves = effective_octave_count(
-            uniforms.noise_octaves,
-            uniforms.noise_lacunarity,
-            min_feature_hit,
-        );
+    if (uniforms.debug_mode == 1u) {
+        let octaves = effective_octave_count(uniforms.noise_octaves, uniforms.noise_lacunarity, min_feature_hit);
         final_color = heatmap(octaves / f32(uniforms.noise_octaves));
-    } else if uniforms.debug_mode == 2u {
-        // Ray step count: blue (1 step) → red (MAX_STEPS)
+    } else if (uniforms.debug_mode == 2u) {
         final_color = heatmap(f32(steps_taken) / f32(MAX_STEPS));
-    } else if uniforms.debug_mode == 3u {
-        // Surface normals mapped to RGB
+    } else if (uniforms.debug_mode == 3u) {
         final_color = normal * 0.5 + 0.5;
     } else {
-        // Normal rendering: Lambertian lighting
-        let ambient = 0.03;
+        let ambient = 0.05;
         let n_dot_l = max(dot(normal, uniforms.sun_direction), 0.0);
         let diffuse = 0.9 * n_dot_l;
-        let brightness = ambient + diffuse;
-        let base_color = vec3(0.5, 0.5, 0.5);
-        final_color = base_color * brightness;
+        final_color = vec3(0.5, 0.5, 0.5) * (ambient + diffuse);
     }
 
     var out: FragmentOutput;

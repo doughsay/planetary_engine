@@ -118,15 +118,9 @@ fn fbm(
     persistence: f32,
     min_feature_size: f32,
 ) -> f32 {
-    // Pre-compute the full amplitude sum for normalization.
-    // This ensures that the output range stays stable regardless of how many
-    // octaves are actually evaluated (culled octaves just add less detail).
-    var full_amp_sum = 0.0;
-    var amp_accum = 1.0;
-    for (var k = 0u; k < max_octaves; k++) {
-        full_amp_sum += amp_accum;
-        amp_accum *= persistence;
-    }
+    // Pre-compute the full amplitude sum for normalization using geometric series formula.
+    // sum = (1 - r^n) / (1 - r)
+    let full_amp_sum = (1.0 - pow(persistence, f32(max_octaves))) / (1.0 - persistence);
 
     var value = 0.0;
     var amplitude = 1.0;
