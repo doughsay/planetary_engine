@@ -116,8 +116,14 @@ fn crater_field(
         for (var dy: i32 = -1; dy <= 1; dy += 1) {
             for (var dz: i32 = -1; dz <= 1; dz += 1) {
                 let neighbor = cell + vec3<f32>(f32(dx), f32(dy), f32(dz));
-                let h = hash33(neighbor);
+                
+                // Quick bounding-box check: skip cells that are too far to contain
+                // a crater that could influence the current point 'p'.
+                let cell_to_p = p - (neighbor + 0.5);
+                let closest_dist_sq = dot(max(abs(cell_to_p) - 0.5, vec3(0.0)), max(abs(cell_to_p) - 0.5, vec3(0.0)));
+                if (closest_dist_sq > 1.0) { continue; } 
 
+                let h = hash33(neighbor);
                 if (h.z > density) { continue; }
 
                 let crater_pos = neighbor + h * 0.8 + 0.1;
@@ -143,34 +149,43 @@ fn crater_field(
 const MAX_STEPS: u32 = 256u; 
 const SURFACE_EPSILON: f32 = 0.005; // 5m in km units
 
-/// Evaluate the planet SDF with full detail.
-fn planet_sdf(p: vec3<f32>, min_feature_size: f32) -> f32 {
+/// Evaluate the planet SDF. 
+/// - quality 0: Fast traversal (fewer octaves, no small craters)
+/// - quality 1: Full detail (all octaves, all craters)
+fn planet_sdf(p: vec3<f32>, min_feature_size: f32, quality: u32) -> f32 {
     let dist_to_center = length(p - uniforms.planet_center);
     let dir = (p - uniforms.planet_center) / dist_to_center;
 
+    // Traversal (quality 0) uses a capped octave count for speed.
+    let octaves = select(uniforms.noise_octaves, min(uniforms.noise_octaves, 4u), quality == 0u);
+
     var elevation = fbm(
         dir * uniforms.noise_frequency,
-        uniforms.noise_octaves,
+        octaves,
         uniforms.noise_lacunarity,
         uniforms.noise_persistence,
         min_feature_size,
     ) * uniforms.noise_amplitude;
 
     if (uniforms.crater_enabled != 0u) {
+        // Always evaluate large craters
         elevation += crater_field(dir,
             uniforms.crater_frequency_0, uniforms.crater_depth_0,
             uniforms.crater_rim_height_0, uniforms.crater_peak_height_0,
             uniforms.crater_density_0, min_feature_size);
         
-        elevation += crater_field(dir,
-            uniforms.crater_frequency_1, uniforms.crater_depth_1,
-            uniforms.crater_rim_height_1, uniforms.crater_peak_height_1,
-            uniforms.crater_density_1, min_feature_size);
-            
-        elevation += crater_field(dir,
-            uniforms.crater_frequency_2, uniforms.crater_depth_2,
-            uniforms.crater_rim_height_2, uniforms.crater_peak_height_2,
-            uniforms.crater_density_2, min_feature_size);
+        // Only evaluate smaller craters at high quality
+        if (quality > 0u) {
+            elevation += crater_field(dir,
+                uniforms.crater_frequency_1, uniforms.crater_depth_1,
+                uniforms.crater_rim_height_1, uniforms.crater_peak_height_1,
+                uniforms.crater_density_1, min_feature_size);
+                
+            elevation += crater_field(dir,
+                uniforms.crater_frequency_2, uniforms.crater_depth_2,
+                uniforms.crater_rim_height_2, uniforms.crater_peak_height_2,
+                uniforms.crater_density_2, min_feature_size);
+        }
     }
 
     return dist_to_center - (uniforms.planet_radius + elevation);
@@ -184,11 +199,12 @@ fn compute_normal(p: vec3<f32>, cam_dist: f32, min_feature_size: f32) -> vec3<f3
     // Scale epsilon with distance for stability.
     let eps = max(cam_dist * 0.0001, SURFACE_EPSILON * 0.5);
     
-    let d = planet_sdf(p, min_feature_size);
+    // Normal computation ALWAYS uses full quality (1)
+    let d = planet_sdf(p, min_feature_size, 1u);
     let n = vec3(
-        planet_sdf(p + vec3(eps, 0.0, 0.0), min_feature_size) - d,
-        planet_sdf(p + vec3(0.0, eps, 0.0), min_feature_size) - d,
-        planet_sdf(p + vec3(0.0, 0.0, eps), min_feature_size) - d,
+        planet_sdf(p + vec3(eps, 0.0, 0.0), min_feature_size, 1u) - d,
+        planet_sdf(p + vec3(0.0, eps, 0.0), min_feature_size, 1u) - d,
+        planet_sdf(p + vec3(0.0, 0.0, eps), min_feature_size, 1u) - d,
     );
 
     return normalize(n);
@@ -306,6 +322,7 @@ fn fragment(in: VertexOutput, @builtin(front_facing) front_facing: bool) -> Frag
     var current_pos = ray_origin + ray_dir * t;
     var current_dir = ray_dir;
     var first_hit_pos = vec3(0.0);
+    var surface_normal = vec3(0.0);
     var has_hit = false;
 
     for (var i = 0u; i < MAX_STEPS; i++) {
@@ -328,7 +345,7 @@ fn fragment(in: VertexOutput, @builtin(front_facing) front_facing: bool) -> Frag
             in_detail_zone = true;
             let world_pixel_size = t * 0.0005;
             let min_feature_size = world_pixel_size * uniforms.noise_frequency / uniforms.planet_radius;
-            d = planet_sdf(current_pos, min_feature_size);
+            d = planet_sdf(current_pos, min_feature_size, 0u);
 
             if (d < cone_radius) {
                 let coverage = clamp(0.5 - 0.5 * d / cone_radius, 0.0, 1.0);
@@ -338,13 +355,13 @@ fn fragment(in: VertexOutput, @builtin(front_facing) front_facing: bool) -> Frag
                     if (!has_hit) { 
                         first_hit_pos = current_pos;
                         has_hit = true;
+                        // Compute the high-quality normal ONLY once for the first hit
+                        let min_feature_hit = cone_radius * uniforms.noise_frequency / uniforms.planet_radius;
+                        surface_normal = compute_normal(current_pos, t, min_feature_hit);
                     }
 
-                    let min_feature_hit = cone_radius * uniforms.noise_frequency / uniforms.planet_radius;
-                    let normal = compute_normal(current_pos, t, min_feature_hit);
-                    
                     let ambient = 0.05;
-                    let n_dot_l = max(dot(normal, uniforms.sun_direction), 0.0);
+                    let n_dot_l = max(dot(surface_normal, uniforms.sun_direction), 0.0);
                     let diffuse = 0.9 * n_dot_l;
                     let slice_color = vec3(0.5, 0.5, 0.5) * (ambient + diffuse);
 
