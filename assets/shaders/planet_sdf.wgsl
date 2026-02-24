@@ -265,12 +265,15 @@ fn fragment(in: VertexOutput, @builtin(front_facing) front_facing: bool) -> Frag
     var t = max(bounds.x, 0.0);
     var t_end = bounds.y;
 
-    let pixel_angular_size = 0.0005;
-    var hit = false;
+    // Cone Tracing Parameters
+    let cone_angle = 0.001; // Radians. Larger = blurrier horizon, faster rendering.
+    var total_alpha = 0.0;
+    var accumulated_color = vec3(0.0);
     var steps_taken = 0u;
+    var first_hit_t = -1.0;
 
     for (var i = 0u; i < MAX_STEPS; i++) {
-        if (t > t_end) { break; }
+        if (t > t_end || total_alpha > 0.99) { break; }
 
         let p = ray_origin + ray_dir * t;
         let dist_to_center = length(p - uniforms.planet_center);
@@ -283,66 +286,79 @@ fn fragment(in: VertexOutput, @builtin(front_facing) front_facing: bool) -> Frag
         var d: f32;
         var in_detail_zone = false;
 
+        let cone_radius = t * cone_angle;
+
         if (safe_bound > 2.0) {
             d = safe_bound;
         } else {
             in_detail_zone = true;
-            let world_pixel_size = t * pixel_angular_size;
+            let world_pixel_size = t * 0.0005; // Base LOD for noise
             let min_feature_size = world_pixel_size * uniforms.noise_frequency / uniforms.planet_radius;
             d = planet_sdf(p, min_feature_size);
+
+            // Cone Tracing "Partial Hit" accumulation
+            if (d < cone_radius) {
+                // Determine coverage: 1.0 at center, 0.0 at cone edge
+                let coverage = clamp(0.5 - 0.5 * d / cone_radius, 0.0, 1.0);
+                let weight = (1.0 - total_alpha) * coverage;
+
+                if (weight > 0.001) {
+                    if (first_hit_t < 0.0) { first_hit_t = t; }
+
+                    // Compute lighting for this "slice" of the cone
+                    let min_feature_hit = cone_radius * uniforms.noise_frequency / uniforms.planet_radius;
+                    let normal = compute_normal(p, t, min_feature_hit);
+                    
+                    let ambient = 0.05;
+                    let n_dot_l = max(dot(normal, uniforms.sun_direction), 0.0);
+                    let diffuse = 0.9 * n_dot_l;
+                    let slice_color = vec3(0.5, 0.5, 0.5) * (ambient + diffuse);
+
+                    accumulated_color += weight * slice_color;
+                    total_alpha += weight;
+                }
+            }
         }
 
         steps_taken = i + 1u;
 
         if (in_detail_zone) {
-            let world_pixel_size = t * pixel_angular_size;
-            let epsilon = clamp(world_pixel_size * 0.5, SURFACE_EPSILON, 0.05);
-            
-            if (d < epsilon) {
-                hit = true;
-                break;
-            }
-            
-            // Be more conservative at grazing angles to fix holes.
-            // We can detect grazing by checking how 'd' changes, but a simple 
-            // relaxation factor that scales with distance to center is easier.
-            let relaxation = mix(0.4, 0.8, smoothstep(0.0, 5.0, d));
-            t += max(d * relaxation, epsilon * 0.5);
+            // THE CHEAT: Instead of tiny steps (SURFACE_EPSILON), 
+            // we jump by the cone radius. This prevents the death spiral.
+            t += max(d, cone_radius * 0.5);
         } else {
-            // Far jump: no relaxation needed for the conservative bound.
             t += d; 
         }
     }
 
-    if (!hit) { discard; }
+    if (total_alpha < 0.01) { discard; }
 
-    let hit_pos = ray_origin + ray_dir * t;
-    let cam_dist_hit = t;
-    let world_pixel_hit = cam_dist_hit * pixel_angular_size;
-    let min_feature_hit = world_pixel_hit * uniforms.noise_frequency / uniforms.planet_radius;
-
-    let normal = compute_normal(hit_pos, cam_dist_hit, min_feature_hit);
+    // Use first_hit_t for depth calculation to prevent "leaking" through the planet
+    let depth_t = select(t, first_hit_t, first_hit_t > 0.0);
+    let hit_pos = ray_origin + ray_dir * depth_t;
     let clip_pos = view.clip_from_world * vec4(hit_pos, 1.0);
     let ndc_depth = clip_pos.z / clip_pos.w;
 
     var final_color: vec3<f32>;
 
     if (uniforms.debug_mode == 1u) {
+        let world_pixel_hit = depth_t * 0.0005;
+        let min_feature_hit = world_pixel_hit * uniforms.noise_frequency / uniforms.planet_radius;
         let octaves = effective_octave_count(uniforms.noise_octaves, uniforms.noise_lacunarity, min_feature_hit);
         final_color = heatmap(octaves / f32(uniforms.noise_octaves));
     } else if (uniforms.debug_mode == 2u) {
         final_color = heatmap(f32(steps_taken) / f32(MAX_STEPS));
     } else if (uniforms.debug_mode == 3u) {
-        final_color = normal * 0.5 + 0.5;
+        // For debug normal mode, we just use the first hit's normal
+        let world_pixel_hit = depth_t * 0.0005;
+        let min_feature_hit = world_pixel_hit * uniforms.noise_frequency / uniforms.planet_radius;
+        final_color = compute_normal(hit_pos, depth_t, min_feature_hit) * 0.5 + 0.5;
     } else {
-        let ambient = 0.05;
-        let n_dot_l = max(dot(normal, uniforms.sun_direction), 0.0);
-        let diffuse = 0.9 * n_dot_l;
-        final_color = vec3(0.5, 0.5, 0.5) * (ambient + diffuse);
+        final_color = accumulated_color;
     }
 
     var out: FragmentOutput;
-    out.color = vec4(final_color, 1.0);
+    out.color = vec4(final_color, total_alpha);
     out.depth = ndc_depth;
     return out;
 }
