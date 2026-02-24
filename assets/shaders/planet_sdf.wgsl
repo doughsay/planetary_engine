@@ -157,7 +157,8 @@ fn planet_sdf(p: vec3<f32>, min_feature_size: f32, quality: u32) -> f32 {
     let dir = (p - uniforms.planet_center) / dist_to_center;
 
     // Traversal (quality 0) uses a capped octave count for speed.
-    let octaves = select(uniforms.noise_octaves, min(uniforms.noise_octaves, 4u), quality == 0u);
+    // Increased from 4 to 8 to better match lighting details.
+    let octaves = select(uniforms.noise_octaves, min(uniforms.noise_octaves, 8u), quality == 0u);
 
     var elevation = fbm(
         dir * uniforms.noise_frequency,
@@ -174,13 +175,16 @@ fn planet_sdf(p: vec3<f32>, min_feature_size: f32, quality: u32) -> f32 {
             uniforms.crater_rim_height_0, uniforms.crater_peak_height_0,
             uniforms.crater_density_0, min_feature_size);
         
-        // Only evaluate smaller craters at high quality
-        if (quality > 0u) {
+        // Medium craters now enabled in quality 0 for better parallax matching
+        if (quality > 0u || uniforms.crater_frequency_1 < 25.0) {
             elevation += crater_field(dir,
                 uniforms.crater_frequency_1, uniforms.crater_depth_1,
                 uniforms.crater_rim_height_1, uniforms.crater_peak_height_1,
                 uniforms.crater_density_1, min_feature_size);
-                
+        }
+        
+        // Only evaluate smallest craters at high quality
+        if (quality > 0u) {
             elevation += crater_field(dir,
                 uniforms.crater_frequency_2, uniforms.crater_depth_2,
                 uniforms.crater_rim_height_2, uniforms.crater_peak_height_2,
@@ -373,7 +377,13 @@ fn fragment(in: VertexOutput, @builtin(front_facing) front_facing: bool) -> Frag
 
         steps_taken = i + 1u;
 
-        let step = select(d, max(d, cone_radius * 0.5), in_detail_zone);
+        // THE FIX: Undermarching (Relaxation)
+        // Since noise/craters aren't a 'true' SDF, they can overestimate distance.
+        // We multiply 'd' by a relaxation factor (0.5 - 0.7) to ensure we never 
+        // tunnel through a feature. We also cap the minimum step more tightly.
+        let relaxation = select(1.0, 0.6, in_detail_zone);
+        let min_step = select(0.1, max(cone_radius * 0.2, SURFACE_EPSILON), in_detail_zone);
+        let step = max(d * relaxation, min_step);
         
         // THE CHEAT: Bend the ray toward the planet center
         let to_center = (uniforms.planet_center - current_pos) / dist_to_center;
