@@ -18,6 +18,7 @@ pub struct Orbit {
 pub struct OrbitalTime {
     pub speed: f64, 
     pub elapsed: f64,
+    pub start_time: Option<f64>,
 }
 
 impl Default for OrbitalTime {
@@ -25,6 +26,7 @@ impl Default for OrbitalTime {
         Self {
             speed: 1.0,
             elapsed: 0.0,
+            start_time: None,
         }
     }
 }
@@ -48,7 +50,14 @@ fn update_orbits(
     )>,
 ) {
     let Ok(grid) = grid_q.single() else { return };
-    orbital_time.elapsed += time.delta_secs_f64() * orbital_time.speed;
+    
+    // Sync to absolute engine time to avoid accumulation drift
+    let current_time = time.elapsed_secs_f64();
+    if orbital_time.start_time.is_none() {
+        orbital_time.start_time = Some(current_time);
+    }
+    
+    orbital_time.elapsed = (current_time - orbital_time.start_time.unwrap()) * orbital_time.speed;
     let t = orbital_time.elapsed;
 
     // 1. Calculate local orbital positions for all bodies
