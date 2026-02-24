@@ -296,49 +296,52 @@ fn fragment(in: VertexOutput, @builtin(front_facing) front_facing: bool) -> Frag
         t_end = inner_bounds.x;
     }
 
-    // Cone Tracing Parameters
-    let cone_angle = 0.001; // Radians. Larger = blurrier horizon, faster rendering.
+    // Cone Tracing & Bending Parameters
+    let cone_angle = 0.001; 
+    let bending_strength = 0.1; // Curvature per km.
     var total_alpha = 0.0;
     var accumulated_color = vec3(0.0);
     var steps_taken = 0u;
-    var first_hit_t = -1.0;
+    
+    var current_pos = ray_origin + ray_dir * t;
+    var current_dir = ray_dir;
+    var first_hit_pos = vec3(0.0);
+    var has_hit = false;
 
     for (var i = 0u; i < MAX_STEPS; i++) {
-        if (t > t_end || total_alpha > 0.99) { break; }
+        let dist_to_center = length(current_pos - uniforms.planet_center);
+        
+        // Exit if we go too far from the planet or accumulate enough opacity
+        if (dist_to_center > bounding_radius + 5.0 && i > 0u) { break; }
+        if (total_alpha > 0.99) { break; }
 
-        let p = ray_origin + ray_dir * t;
-        let dist_to_center = length(p - uniforms.planet_center);
         let d_sphere = dist_to_center - uniforms.planet_radius;
-
-        // Adaptive quality traversal:
-        // Use a strictly conservative bound when far from the possible surface.
         let safe_bound = d_sphere - uniforms.max_elevation;
         
         var d: f32;
         var in_detail_zone = false;
-
         let cone_radius = t * cone_angle;
 
         if (safe_bound > 2.0) {
             d = safe_bound;
         } else {
             in_detail_zone = true;
-            let world_pixel_size = t * 0.0005; // Base LOD for noise
+            let world_pixel_size = t * 0.0005;
             let min_feature_size = world_pixel_size * uniforms.noise_frequency / uniforms.planet_radius;
-            d = planet_sdf(p, min_feature_size);
+            d = planet_sdf(current_pos, min_feature_size);
 
-            // Cone Tracing "Partial Hit" accumulation
             if (d < cone_radius) {
-                // Determine coverage: 1.0 at center, 0.0 at cone edge
                 let coverage = clamp(0.5 - 0.5 * d / cone_radius, 0.0, 1.0);
                 let weight = (1.0 - total_alpha) * coverage;
 
                 if (weight > 0.001) {
-                    if (first_hit_t < 0.0) { first_hit_t = t; }
+                    if (!has_hit) { 
+                        first_hit_pos = current_pos;
+                        has_hit = true;
+                    }
 
-                    // Compute lighting for this "slice" of the cone
                     let min_feature_hit = cone_radius * uniforms.noise_frequency / uniforms.planet_radius;
-                    let normal = compute_normal(p, t, min_feature_hit);
+                    let normal = compute_normal(current_pos, t, min_feature_hit);
                     
                     let ambient = 0.05;
                     let n_dot_l = max(dot(normal, uniforms.sun_direction), 0.0);
@@ -353,37 +356,35 @@ fn fragment(in: VertexOutput, @builtin(front_facing) front_facing: bool) -> Frag
 
         steps_taken = i + 1u;
 
-        if (in_detail_zone) {
-            // THE CHEAT: Instead of tiny steps (SURFACE_EPSILON), 
-            // we jump by the cone radius. This prevents the death spiral.
-            t += max(d, cone_radius * 0.5);
-        } else {
-            t += d; 
-        }
+        let step = select(d, max(d, cone_radius * 0.5), in_detail_zone);
+        
+        // THE CHEAT: Bend the ray toward the planet center
+        let to_center = (uniforms.planet_center - current_pos) / dist_to_center;
+        current_dir = normalize(current_dir + to_center * bending_strength * (step / uniforms.planet_radius));
+        
+        current_pos += current_dir * step;
+        t += step;
     }
 
     if (total_alpha < 0.01) { discard; }
 
-    // Use first_hit_t for depth calculation to prevent "leaking" through the planet
-    let depth_t = select(t, first_hit_t, first_hit_t > 0.0);
-    let hit_pos = ray_origin + ray_dir * depth_t;
-    let clip_pos = view.clip_from_world * vec4(hit_pos, 1.0);
+    let final_hit_pos = select(current_pos, first_hit_pos, has_hit);
+    let clip_pos = view.clip_from_world * vec4(final_hit_pos, 1.0);
     let ndc_depth = clip_pos.z / clip_pos.w;
 
     var final_color: vec3<f32>;
 
     if (uniforms.debug_mode == 1u) {
-        let world_pixel_hit = depth_t * 0.0005;
+        let world_pixel_hit = t * 0.0005; 
         let min_feature_hit = world_pixel_hit * uniforms.noise_frequency / uniforms.planet_radius;
         let octaves = effective_octave_count(uniforms.noise_octaves, uniforms.noise_lacunarity, min_feature_hit);
         final_color = heatmap(octaves / f32(uniforms.noise_octaves));
     } else if (uniforms.debug_mode == 2u) {
         final_color = heatmap(f32(steps_taken) / f32(MAX_STEPS));
     } else if (uniforms.debug_mode == 3u) {
-        // For debug normal mode, we just use the first hit's normal
-        let world_pixel_hit = depth_t * 0.0005;
+        let world_pixel_hit = t * 0.0005;
         let min_feature_hit = world_pixel_hit * uniforms.noise_frequency / uniforms.planet_radius;
-        final_color = compute_normal(hit_pos, depth_t, min_feature_hit) * 0.5 + 0.5;
+        final_color = compute_normal(final_hit_pos, t, min_feature_hit) * 0.5 + 0.5;
     } else {
         final_color = accumulated_color;
     }
