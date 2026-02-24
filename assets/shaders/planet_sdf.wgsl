@@ -258,12 +258,43 @@ fn fragment(in: VertexOutput, @builtin(front_facing) front_facing: bool) -> Frag
     let ray_dir = normalize(in.world_position - ray_origin);
 
     let bounding_radius = uniforms.planet_radius + uniforms.max_elevation;
-    let bounds = ray_sphere(ray_origin, ray_dir, uniforms.planet_center, bounding_radius);
+    
+    // THE PROXY SHELL optimization:
+    // Since we are in the fragment shader of the bounding icosphere, 'in.world_position'
+    // is already a point on the "Max Height" shell.
+    
+    var t: f32;
+    var t_end: f32;
+    
+    let dist_to_center_cam = length(ray_origin - uniforms.planet_center);
+    
+    if (dist_to_center_cam > bounding_radius) {
+        // Camera is outside the shell. Start at the shell entry point.
+        t = length(in.world_position - ray_origin);
+        
+        // We need t_end. We can get it from a ray_sphere test, 
+        // but we only need the "far" intersection.
+        let bounds = ray_sphere(ray_origin, ray_dir, uniforms.planet_center, bounding_radius);
+        t_end = bounds.y;
+    } else {
+        // Camera is inside the shell. Start at camera.
+        t = 0.0;
+        
+        // The fragment we are rendering is likely the BACK face if we see anything,
+        // so 'in.world_position' is the exit point.
+        t_end = length(in.world_position - ray_origin);
+    }
 
-    if (bounds.x > bounds.y) { discard; }
+    if (t > t_end) { discard; }
 
-    var t = max(bounds.x, 0.0);
-    var t_end = bounds.y;
+    // SECOND PROXY SHELL: Deep Floor
+    // We can stop at a 'minimum elevation' shell. We'll use radius - max_elevation
+    // as a safe floor that is deeper than any crater or valley.
+    let inner_radius = uniforms.planet_radius - uniforms.max_elevation;
+    let inner_bounds = ray_sphere(ray_origin, ray_dir, uniforms.planet_center, inner_radius);
+    if (inner_bounds.x < inner_bounds.y && inner_bounds.x > t) {
+        t_end = inner_bounds.x;
+    }
 
     // Cone Tracing Parameters
     let cone_angle = 0.001; // Radians. Larger = blurrier horizon, faster rendering.
